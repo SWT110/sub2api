@@ -902,6 +902,8 @@ var allowedWindowsForQuotaReset = map[string]struct{}{
 	"monthly": {},
 }
 
+const rollingWeeklyQuotaWindowDuration = 7 * 24 * time.Hour
+
 // ResetUserPlatformQuotaWindow POST /admin/users/:id/platform-quotas/reset
 // 立即归零指定 (platform, window) 的用量并更新 window_start。
 func (h *UserHandler) ResetUserPlatformQuotaWindow(c *gin.Context) {
@@ -985,6 +987,99 @@ func (h *UserHandler) ResetUserPlatformQuotaWindow(c *gin.Context) {
 			slog.Error("ALERT: quota cache invalidation failed after ResetExpiredWindow; 窗口重置可能延迟至 sentinel TTL(最长 1h)", "user_id", userID, "platform", req.Platform, "err", err)
 		}
 	}
+
+	records, err := h.userPlatformQuotaRepo.ListByUser(ctx, userID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(records))
+	for i := range records {
+		out = append(out, quotaview.LazyZeroQuotaForResponse(records[i], now, true))
+	}
+	response.Success(c, map[string]any{"platform_quotas": out})
+}
+
+// UpdateUserPlatformQuotaWeeklyWindowStartRequest is the body for
+// PATCH /admin/users/:id/platform-quotas/weekly-window-start.
+// Unlike the reset endpoint, this action intentionally preserves usage.
+type UpdateUserPlatformQuotaWeeklyWindowStartRequest struct {
+	Platform string `json:"platform" binding:"required"`
+	StartAt  string `json:"start_at" binding:"required"`
+}
+
+// UpdateUserPlatformQuotaWeeklyWindowStart adjusts one configured platform's
+// current rolling weekly anchor without clearing weekly_usage_usd. Limiting
+// starts to the active seven-day period makes the "preserve usage" guarantee
+// meaningful: an already-expired start would otherwise be reset on the next
+// billing request.
+func (h *UserHandler) UpdateUserPlatformQuotaWeeklyWindowStart(c *gin.Context) {
+	if h.userPlatformQuotaRepo == nil {
+		response.Error(c, 503, "platform quota service not available")
+		return
+	}
+
+	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid user ID")
+		return
+	}
+
+	var req UpdateUserPlatformQuotaWeeklyWindowStartRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	if !service.IsAllowedQuotaPlatform(req.Platform) {
+		response.BadRequest(c, "invalid platform: "+req.Platform)
+		return
+	}
+
+	newStart, err := time.Parse(time.RFC3339, strings.TrimSpace(req.StartAt))
+	if err != nil {
+		response.BadRequest(c, "start_at must be RFC3339")
+		return
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	newStart = newStart.UTC().Truncate(time.Second)
+	if newStart.After(now) {
+		response.BadRequest(c, "start_at cannot be in the future")
+		return
+	}
+	if !newStart.Add(rollingWeeklyQuotaWindowDuration).After(now) {
+		response.BadRequest(c, "start_at must be within the current seven-day weekly window")
+		return
+	}
+
+	ctx := c.Request.Context()
+	if _, err := h.adminService.GetUser(ctx, userID); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if err := h.userPlatformQuotaRepo.SetWeeklyWindowStart(ctx, userID, req.Platform, newStart); err != nil {
+		if errors.Is(err, service.ErrUserPlatformQuotaNotFound) {
+			response.NotFound(c, "configured user weekly quota not found")
+			return
+		}
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	// The cached entry includes both weekly usage and its anchor. Invalidate it
+	// instead of using the reset-cache helper, which would incorrectly zero the
+	// usage that this endpoint must preserve.
+	if h.billingCache != nil {
+		if err := h.billingCache.DeleteUserPlatformQuotaCache(ctx, userID, req.Platform); err != nil {
+			slog.Error("ALERT: quota cache invalidation failed after weekly window anchor update; stale anchor may last until TTL", "user_id", userID, "platform", req.Platform, "err", err)
+		}
+	}
+
+	slog.Info("admin.quota_weekly_window_start_updated",
+		"actor_admin_id", getAdminIDFromContext(c),
+		"target_user_id", userID,
+		"platform", req.Platform,
+		"window_start", newStart,
+		"usage_preserved", true)
 
 	records, err := h.userPlatformQuotaRepo.ListByUser(ctx, userID)
 	if err != nil {

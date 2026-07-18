@@ -236,6 +236,53 @@ func TestUserPlatformQuotaRepository_ResetExpiredWindow(t *testing.T) {
 	require.InDelta(t, 50.0, rec.MonthlyUsageUSD, 1e-9, "monthly usage unchanged")
 }
 
+func TestUserPlatformQuotaRepository_SetWeeklyWindowStartPreservesUsage(t *testing.T) {
+	ctx := context.Background()
+	tx := testEntTx(t)
+	txCtx := dbent.NewTxContext(ctx, tx)
+	client := tx.Client()
+
+	userID := mustCreateUserForQuota(t, client)
+	repo := NewUserPlatformQuotaRepository(client)
+	weeklyLimit := 20.0
+	oldStart := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	_, err := client.UserPlatformQuota.Create().
+		SetUserID(userID).
+		SetPlatform("openai").
+		SetWeeklyLimitUsd(weeklyLimit).
+		SetDailyUsageUsd(2.0).
+		SetWeeklyUsageUsd(8.5).
+		SetMonthlyUsageUsd(13.0).
+		SetWeeklyWindowStart(oldStart).
+		Save(txCtx)
+	require.NoError(t, err)
+
+	newStart := oldStart.Add(2 * time.Hour)
+	require.NoError(t, repo.SetWeeklyWindowStart(txCtx, userID, "openai", newStart))
+
+	rec, err := repo.GetByUserPlatform(txCtx, userID, "openai")
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	require.InDelta(t, 8.5, rec.WeeklyUsageUSD, 1e-9, "weekly usage must be preserved")
+	require.InDelta(t, 2.0, rec.DailyUsageUSD, 1e-9, "daily usage must be preserved")
+	require.InDelta(t, 13.0, rec.MonthlyUsageUSD, 1e-9, "monthly usage must be preserved")
+	require.NotNil(t, rec.WeeklyWindowStart)
+	require.True(t, rec.WeeklyWindowStart.Equal(newStart), "weekly window start should change")
+}
+
+func TestUserPlatformQuotaRepository_SetWeeklyWindowStartRequiresWeeklyLimit(t *testing.T) {
+	ctx := context.Background()
+	client := testEntClient(t)
+	userID := mustCreateUserForQuota(t, client)
+	repo := NewUserPlatformQuotaRepository(client)
+
+	require.NoError(t, repo.BulkInsertInitial(ctx, []UserPlatformQuotaRecord{{
+		UserID: userID, Platform: "openai",
+	}}))
+	err := repo.SetWeeklyWindowStart(ctx, userID, "openai", time.Now())
+	require.True(t, errors.Is(err, ErrUserPlatformQuotaNotFound))
+}
+
 func TestUserPlatformQuotaRepository_ResetExpiredWindow_UnknownWindow(t *testing.T) {
 	ctx := context.Background()
 	client := testEntClient(t)

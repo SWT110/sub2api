@@ -56,11 +56,16 @@ type UserWeeklyQuotaSyncState struct {
 	SourceAccountID       int64      `json:"source_account_id"`
 	ObservedResetAt       *time.Time `json:"observed_reset_at,omitempty"`
 	ObservedWindowSeconds int64      `json:"observed_window_seconds,omitempty"`
-	LastCheckedAt         *time.Time `json:"last_checked_at,omitempty"`
-	LastTriggeredAt       *time.Time `json:"last_triggered_at,omitempty"`
-	LastWindowStart       *time.Time `json:"last_window_start,omitempty"`
-	LastAffectedUsers     int        `json:"last_affected_users"`
-	LastError             string     `json:"last_error,omitempty"`
+	// PendingResetAt is a newly observed upstream reset boundary that must be
+	// returned once more before a mass reset is allowed. Persisting it makes the
+	// confirmation survive service restarts and prevents one bad response from
+	// clearing every user's quota.
+	PendingResetAt    *time.Time `json:"pending_reset_at,omitempty"`
+	LastCheckedAt     *time.Time `json:"last_checked_at,omitempty"`
+	LastTriggeredAt   *time.Time `json:"last_triggered_at,omitempty"`
+	LastWindowStart   *time.Time `json:"last_window_start,omitempty"`
+	LastAffectedUsers int        `json:"last_affected_users"`
+	LastError         string     `json:"last_error,omitempty"`
 }
 
 // UserWeeklyQuotaSyncStatus is returned to the admin UI.
@@ -79,12 +84,13 @@ type UserWeeklyQuotaSyncAccount struct {
 
 // UserWeeklyQuotaSyncCheckResult describes one manual or scheduled check.
 type UserWeeklyQuotaSyncCheckResult struct {
-	BaselineInitialized bool                      `json:"baseline_initialized"`
-	ResetDetected       bool                      `json:"reset_detected"`
-	ResetAt             time.Time                 `json:"reset_at"`
-	WindowStart         time.Time                 `json:"window_start"`
-	AffectedUsers       int                       `json:"affected_users"`
-	Status              UserWeeklyQuotaSyncStatus `json:"status"`
+	BaselineInitialized  bool                      `json:"baseline_initialized"`
+	AwaitingConfirmation bool                      `json:"awaiting_confirmation"`
+	ResetDetected        bool                      `json:"reset_detected"`
+	ResetAt              time.Time                 `json:"reset_at"`
+	WindowStart          time.Time                 `json:"window_start"`
+	AffectedUsers        int                       `json:"affected_users"`
+	Status               UserWeeklyQuotaSyncStatus `json:"status"`
 }
 
 // userWeeklyQuotaBulkResetter is intentionally an optional extension of the
@@ -483,6 +489,7 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 	if state.ObservedResetAt == nil || sourceChanged {
 		state.ObservedResetAt = &resetAt
 		state.ObservedWindowSeconds = weekly.LimitWindowSeconds
+		state.PendingResetAt = nil
 		state.LastError = ""
 		if err := s.saveState(ctx, state); err != nil {
 			return nil, err
@@ -492,7 +499,22 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 		return result, nil
 	}
 
-	if upstreamWeeklyWindowAdvanced(*state.ObservedResetAt, resetAt, weekly.LimitWindowSeconds) {
+	if upstreamWeeklyWindowAdvanced(*state.ObservedResetAt, resetAt) {
+		// A reset boundary is destructive for every configured user. Require a
+		// second consecutive observation of the exact same new reset_at before
+		// applying it. This still accepts early official resets: there is no
+		// "half of a seven-day window" threshold here.
+		if state.PendingResetAt == nil || !resetAt.Equal(*state.PendingResetAt) {
+			state.PendingResetAt = &resetAt
+			state.LastError = ""
+			if err := s.saveState(ctx, state); err != nil {
+				return nil, err
+			}
+			result.AwaitingConfirmation = true
+			result.Status = UserWeeklyQuotaSyncStatus{Config: *cfg, State: *state}
+			return result, nil
+		}
+
 		affected, resetErr := s.resetUsersAt(ctx, windowStart)
 		if resetErr != nil {
 			state.LastError = resetErr.Error()
@@ -506,8 +528,14 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 		result.AffectedUsers = affected
 	}
 
-	state.ObservedResetAt = &resetAt
-	state.ObservedWindowSeconds = weekly.LimitWindowSeconds
+	// Do not replace the last confirmed observation with a backward timestamp:
+	// an inconsistent upstream response must never make a later real reset look
+	// old. An equal timestamp is still allowed to refresh the window metadata.
+	if !resetAt.Before(*state.ObservedResetAt) {
+		state.ObservedResetAt = &resetAt
+		state.ObservedWindowSeconds = weekly.LimitWindowSeconds
+	}
+	state.PendingResetAt = nil
 	state.LastError = ""
 	if err := s.saveState(ctx, state); err != nil {
 		return nil, err
@@ -536,15 +564,8 @@ func (s *UserWeeklyQuotaSyncService) currentTime() time.Time {
 	return time.Now()
 }
 
-func upstreamWeeklyWindowAdvanced(previous, current time.Time, windowSeconds int64) bool {
-	if !current.After(previous) {
-		return false
-	}
-	threshold := time.Duration(windowSeconds/2) * time.Second
-	if threshold < time.Hour {
-		threshold = time.Hour
-	}
-	return current.Sub(previous) >= threshold
+func upstreamWeeklyWindowAdvanced(previous, current time.Time) bool {
+	return current.After(previous)
 }
 
 func findOpenAIWeeklyQuotaWindow(usage *OpenAIQuotaUsage) (*OpenAIRateLimitWindow, error) {

@@ -64,6 +64,10 @@ type UserPlatformQuotaRepository interface {
 	// ResetExpiredWindow 重置指定窗口（"daily"|"weekly"|"monthly"）的用量与起始时间。
 	// 未命中活跃记录时返回（service-side wrapper of repository.ErrUserPlatformQuotaNotFound）。
 	ResetExpiredWindow(ctx context.Context, userID int64, platform string, window string, newStart time.Time) error
+	// SetWeeklyWindowStart 仅调整周窗口的起始时间，保留已用周额度和配置的周限额。
+	// 仅允许操作已配置 weekly_limit_usd 的活跃记录；未命中时返回
+	// ErrUserPlatformQuotaNotFound。
+	SetWeeklyWindowStart(ctx context.Context, userID int64, platform string, newStart time.Time) error
 	// BatchSnapshotUsage 绝对值覆盖写入整批 usage 快照。FK 违反返回 ErrUserPlatformQuotaFKViolation。
 	BatchSnapshotUsage(ctx context.Context, snapshots []UserPlatformQuotaSnapshot, now time.Time) error
 }

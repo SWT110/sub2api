@@ -66,6 +66,9 @@ type UserPlatformQuotaRepository interface {
 	IncrementUsageWithReset(ctx context.Context, userID int64, platform string, cost float64, now time.Time) error
 	// ResetExpiredWindow 重置指定窗口（daily/weekly/monthly）的用量与起始时间。
 	ResetExpiredWindow(ctx context.Context, userID int64, platform string, window string, newStart time.Time) error
+	// SetWeeklyWindowStart only changes a configured weekly quota's rolling
+	// window anchor. It deliberately preserves weekly_usage_usd.
+	SetWeeklyWindowStart(ctx context.Context, userID int64, platform string, newStart time.Time) error
 	// ResetWeeklyWindowForPlatform atomically resets weekly usage for rows with
 	// a configured weekly limit whose window began before newStart. The returned
 	// IDs are the exact rows changed, so callers can keep Redis coherent.
@@ -271,6 +274,32 @@ func (r *userPlatformQuotaRepository) ResetExpiredWindow(ctx context.Context, us
 		return fmt.Errorf("unknown window %q", window)
 	}
 	n, err := upd.Save(ctx)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrUserPlatformQuotaNotFound
+	}
+	return nil
+}
+
+// SetWeeklyWindowStart changes only the weekly rolling-window anchor for one
+// user/platform quota. In particular, it must never reuse ResetExpiredWindow:
+// that method also clears weekly usage. Requiring weekly_limit_usd protects an
+// unconfigured quota row from acquiring a misleading window start.
+func (r *userPlatformQuotaRepository) SetWeeklyWindowStart(ctx context.Context, userID int64, platform string, newStart time.Time) error {
+	client := clientFromContext(ctx, r.client)
+	newStart = newStart.UTC().Truncate(time.Second)
+	n, err := client.UserPlatformQuota.Update().
+		Where(
+			userplatformquota.UserIDEQ(userID),
+			userplatformquota.PlatformEQ(platform),
+			userplatformquota.DeletedAtIsNil(),
+			userplatformquota.WeeklyLimitUsdNotNil(),
+		).
+		SetWeeklyWindowStart(newStart).
+		SetUpdatedAt(time.Now().UTC()).
+		Save(ctx)
 	if err != nil {
 		return err
 	}

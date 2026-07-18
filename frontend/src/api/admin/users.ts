@@ -370,6 +370,7 @@ export interface UserWeeklyQuotaSyncState {
   source_account_id: number
   observed_reset_at?: string | null
   observed_window_seconds?: number | null
+  pending_reset_at?: string | null
   last_checked_at?: string | null
   last_triggered_at?: string | null
   last_window_start?: string | null
@@ -391,6 +392,7 @@ export interface UserWeeklyQuotaSyncSourceAccount {
 
 export interface UserWeeklyQuotaSyncCheckResult {
   baseline_initialized: boolean
+  awaiting_confirmation: boolean
   reset_detected: boolean
   reset_at: string
   window_start: string
@@ -444,6 +446,22 @@ export async function resetPlatformQuotaWindow(
   const { data } = await apiClient.post<PlatformQuotasResponse>(
     `/admin/users/${id}/platform-quotas/reset`,
     payload
+  )
+  return data
+}
+
+/**
+ * Move one configured platform's rolling weekly-window anchor without
+ * clearing its already-used weekly quota.
+ */
+export async function updatePlatformQuotaWeeklyWindowStart(
+  id: number,
+  platform: PlatformQuotaPlatform,
+  startAt: string
+): Promise<PlatformQuotasResponse> {
+  const { data } = await apiClient.patch<PlatformQuotasResponse>(
+    `/admin/users/${id}/platform-quotas/weekly-window-start`,
+    { platform, start_at: startAt }
   )
   return data
 }
@@ -510,6 +528,7 @@ export const usersAPI = {
   getPlatformQuotas,
   updatePlatformQuotas,
   resetPlatformQuotaWindow,
+  updatePlatformQuotaWeeklyWindowStart,
   getUserWeeklyQuotaSyncStatus,
   updateUserWeeklyQuotaSyncConfig,
   listUserWeeklyQuotaSyncSourceAccounts,

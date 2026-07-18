@@ -17,11 +17,11 @@
       </p>
       <div class="flex flex-wrap items-end gap-3 border-b border-gray-200 pb-4 dark:border-dark-700">
         <div class="min-w-0 flex-1">
-          <label for="weekly-reset-start" class="input-label">
+          <label for="weekly-window-start" class="input-label">
             {{ t('admin.users.platformQuota.weeklyStartAt') }}
           </label>
           <input
-            id="weekly-reset-start"
+            id="weekly-window-start"
             v-model="weeklyResetStart"
             type="datetime-local"
             class="input w-full sm:max-w-xs"
@@ -78,10 +78,17 @@
                   <button
                     type="button"
                     class="text-xs text-gray-400 hover:text-amber-500 disabled:opacity-50"
-                    :disabled="!!resetting[`${row.platform}.weekly`]"
+                    :disabled="!!resetting[`${row.platform}.weekly`] || !!adjustingWeeklyStart[row.platform]"
                     :title="t('admin.users.platformQuota.reset.button')"
                     @click="onReset(row.platform, 'weekly')"
                   >↻</button>
+                  <button
+                    type="button"
+                    class="text-xs text-primary-600 hover:text-primary-700 disabled:opacity-50 dark:text-primary-400 dark:hover:text-primary-300"
+                    :disabled="!!adjustingWeeklyStart[row.platform] || !!resetting[`${row.platform}.weekly`] || row.weekly_limit_usd === null"
+                    :title="t('admin.users.platformQuota.adjustWeeklyStart.title')"
+                    @click="onAdjustWeeklyStart(row.platform)"
+                  >{{ t('admin.users.platformQuota.adjustWeeklyStart.button') }}</button>
                 </div>
               </td>
               <td class="px-3 py-2">
@@ -154,6 +161,7 @@ interface QuotaRow {
   daily_usage_usd: number
   weekly_usage_usd: number
   monthly_usage_usd: number
+  weekly_window_start: string | null
 }
 
 const hasActiveSubscription = computed(() =>
@@ -163,6 +171,7 @@ const hasActiveSubscription = computed(() =>
 const loading = ref(false)
 const submitting = ref(false)
 const resetting = reactive<Record<string, boolean>>({})
+const adjustingWeeklyStart = reactive<Record<string, boolean>>({})
 const quotas = ref<QuotaRow[]>([])
 const weeklyResetStart = ref('')
 
@@ -175,6 +184,7 @@ function emptyRow(p: PlatformQuotaPlatform): QuotaRow {
     daily_usage_usd: 0,
     weekly_usage_usd: 0,
     monthly_usage_usd: 0,
+    weekly_window_start: null,
   }
 }
 
@@ -192,6 +202,7 @@ function normalize(items: PlatformQuotaItem[]): QuotaRow[] {
       daily_usage_usd: it.daily_usage_usd ?? 0,
       weekly_usage_usd: it.weekly_usage_usd ?? 0,
       monthly_usage_usd: it.monthly_usage_usd ?? 0,
+      weekly_window_start: it.weekly_window_start ?? null,
     }
   })
 }
@@ -311,6 +322,44 @@ async function onReset(platform: PlatformQuotaPlatform, quotaWindow: PlatformQuo
     appStore.showError(e?.response?.data?.message || t('admin.users.platformQuota.reset.failed'))
   } finally {
     resetting[key] = false
+  }
+}
+
+async function onAdjustWeeklyStart(platform: PlatformQuotaPlatform) {
+  if (!props.user) return
+  if (!weeklyResetStart.value) {
+    appStore.showError(t('admin.users.platformQuota.adjustWeeklyStart.required'))
+    return
+  }
+  const parsed = new Date(weeklyResetStart.value)
+  if (Number.isNaN(parsed.getTime())) {
+    appStore.showError(t('admin.users.platformQuota.weeklyStartAtInvalid'))
+    return
+  }
+  const now = Date.now()
+  if (parsed.getTime() > now) {
+    appStore.showError(t('admin.users.platformQuota.adjustWeeklyStart.future'))
+    return
+  }
+  if (now - parsed.getTime() >= 7 * 24 * 60 * 60 * 1000) {
+    appStore.showError(t('admin.users.platformQuota.adjustWeeklyStart.expired'))
+    return
+  }
+  if (!window.confirm(t('admin.users.platformQuota.adjustWeeklyStart.confirm', { platform }))) return
+
+  adjustingWeeklyStart[platform] = true
+  try {
+    const data = await adminAPI.users.updatePlatformQuotaWeeklyWindowStart(
+      props.user.id,
+      platform,
+      parsed.toISOString()
+    )
+    quotas.value = normalize(data.platform_quotas || [])
+    appStore.showSuccess(t('admin.users.platformQuota.adjustWeeklyStart.success', { platform }))
+  } catch (e: any) {
+    appStore.showError(e?.response?.data?.message || t('admin.users.platformQuota.adjustWeeklyStart.failed'))
+  } finally {
+    adjustingWeeklyStart[platform] = false
   }
 }
 </script>

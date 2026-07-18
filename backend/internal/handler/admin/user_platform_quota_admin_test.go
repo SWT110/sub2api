@@ -27,6 +27,8 @@ type upsertCapturingQuotaRepo struct {
 	upsertErr   error
 	resetCalls  []resetCall
 	resetErr    error
+	anchorCalls []weeklyAnchorCall
+	anchorErr   error
 }
 
 type upsertCall struct {
@@ -37,6 +39,11 @@ type resetCall struct {
 	userID   int64
 	platform string
 	window   string
+	newStart time.Time
+}
+type weeklyAnchorCall struct {
+	userID   int64
+	platform string
 	newStart time.Time
 }
 
@@ -52,6 +59,10 @@ func (r *upsertCapturingQuotaRepo) UpsertForUser(_ context.Context, userID int64
 func (r *upsertCapturingQuotaRepo) ResetExpiredWindow(_ context.Context, userID int64, platform string, window string, newStart time.Time) error {
 	r.resetCalls = append(r.resetCalls, resetCall{userID, platform, window, newStart})
 	return r.resetErr
+}
+func (r *upsertCapturingQuotaRepo) SetWeeklyWindowStart(_ context.Context, userID int64, platform string, newStart time.Time) error {
+	r.anchorCalls = append(r.anchorCalls, weeklyAnchorCall{userID, platform, newStart})
+	return r.anchorErr
 }
 
 // billingCacheStub 实现 service.BillingCache 中本测试关心的 Delete 方法；其他方法 panic。
@@ -197,6 +208,18 @@ func postReq(t *testing.T, body string) (*gin.Context, *httptest.ResponseRecorde
 	return c, w
 }
 
+func patchReq(t *testing.T, body string) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, _ := http.NewRequest(http.MethodPatch, "/", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	c.Request = req
+	c.Params = []gin.Param{{Key: "id", Value: "42"}}
+	return c, w
+}
+
 func TestResetUserPlatformQuotaWindow_Success(t *testing.T) {
 	repo := &upsertCapturingQuotaRepo{}
 	cache := &billingCacheStub{}
@@ -246,6 +269,73 @@ func TestResetUserPlatformQuotaWindow_NotFound(t *testing.T) {
 	h := buildTestHandler(repo, &billingCacheStub{})
 	c, w := postReq(t, `{"platform":"anthropic","window":"daily"}`)
 	h.ResetUserPlatformQuotaWindow(c)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateUserPlatformQuotaWeeklyWindowStart_PreservesUsage(t *testing.T) {
+	repo := &upsertCapturingQuotaRepo{listRecords: []service.UserPlatformQuotaRecord{{
+		UserID: 42, Platform: "openai", WeeklyUsageUSD: 8.5,
+	}}}
+	cache := &billingCacheStub{}
+	h := buildTestHandler(repo, cache)
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second).Format(time.RFC3339)
+	c, w := patchReq(t, `{"platform":"openai","start_at":"`+start+`"}`)
+	h.UpdateUserPlatformQuotaWeeklyWindowStart(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(repo.anchorCalls) != 1 {
+		t.Fatalf("SetWeeklyWindowStart should be called once, got %d", len(repo.anchorCalls))
+	}
+	got := repo.anchorCalls[0]
+	if got.userID != 42 || got.platform != "openai" {
+		t.Errorf("unexpected anchor call: %+v", got)
+	}
+	wantStart, err := time.Parse(time.RFC3339, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.newStart.Equal(wantStart) {
+		t.Errorf("anchor start = %s, want %s", got.newStart, wantStart)
+	}
+	if len(cache.deleteCalls) != 1 || cache.deleteCalls[0].platform != "openai" {
+		t.Errorf("expected one openai cache invalidation, got %+v", cache.deleteCalls)
+	}
+}
+
+func TestUpdateUserPlatformQuotaWeeklyWindowStart_RejectsFutureOrExpiredStart(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		start time.Time
+	}{
+		{name: "future", start: time.Now().Add(time.Hour)},
+		{name: "expired", start: time.Now().Add(-8 * 24 * time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &upsertCapturingQuotaRepo{}
+			h := buildTestHandler(repo, &billingCacheStub{})
+			body := `{"platform":"openai","start_at":"` + tc.start.UTC().Format(time.RFC3339) + `"}`
+			c, w := patchReq(t, body)
+			h.UpdateUserPlatformQuotaWeeklyWindowStart(c)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
+			}
+			if len(repo.anchorCalls) != 0 {
+				t.Errorf("anchor update should not be called: %+v", repo.anchorCalls)
+			}
+		})
+	}
+}
+
+func TestUpdateUserPlatformQuotaWeeklyWindowStart_NotFound(t *testing.T) {
+	repo := &upsertCapturingQuotaRepo{anchorErr: service.ErrUserPlatformQuotaNotFound}
+	h := buildTestHandler(repo, &billingCacheStub{})
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second).Format(time.RFC3339)
+	c, w := patchReq(t, `{"platform":"openai","start_at":"`+start+`"}`)
+	h.UpdateUserPlatformQuotaWeeklyWindowStart(c)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404, got %d: %s", w.Code, w.Body.String())
 	}

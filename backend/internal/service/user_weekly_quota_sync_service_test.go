@@ -117,7 +117,7 @@ func TestFindOpenAIWeeklyQuotaWindowPrefersCodexAdditionalLimit(t *testing.T) {
 	require.Equal(t, codexReset.Unix(), window.ResetAt)
 }
 
-func TestUserWeeklyQuotaSyncCheckBaselinesThenResetsUsers(t *testing.T) {
+func TestUserWeeklyQuotaSyncCheckBaselinesThenConfirmsAndResetsUsers(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	firstReset := now.Add(3 * 24 * time.Hour)
@@ -136,7 +136,7 @@ func TestUserWeeklyQuotaSyncCheckBaselinesThenResetsUsers(t *testing.T) {
 	service := &UserWeeklyQuotaSyncService{
 		settingRepo:   settings,
 		accountRepo:   accounts,
-		quotaService:  &weeklyQuotaSyncUsageReader{responses: []*OpenAIQuotaUsage{weeklyUsage(firstReset), weeklyUsage(secondReset)}},
+		quotaService:  &weeklyQuotaSyncUsageReader{responses: []*OpenAIQuotaUsage{weeklyUsage(firstReset), weeklyUsage(secondReset), weeklyUsage(secondReset)}},
 		bulkResetter:  resetter,
 		cacheResetter: cache,
 		instanceID:    "test-instance",
@@ -150,6 +150,15 @@ func TestUserWeeklyQuotaSyncCheckBaselinesThenResetsUsers(t *testing.T) {
 	require.Empty(t, resetter.starts)
 
 	now = firstReset.Add(10 * time.Minute)
+	pending, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, pending.AwaitingConfirmation)
+	require.False(t, pending.ResetDetected)
+	require.Empty(t, resetter.starts)
+	require.NotNil(t, pending.Status.State.PendingResetAt)
+	require.Equal(t, secondReset, *pending.Status.State.PendingResetAt)
+
+	now = now.Add(time.Minute)
 	triggered, err := service.CheckNow(ctx)
 	require.NoError(t, err)
 	require.True(t, triggered.ResetDetected)
@@ -160,6 +169,89 @@ func TestUserWeeklyQuotaSyncCheckBaselinesThenResetsUsers(t *testing.T) {
 	require.Equal(t, 1, cache.calls)
 	require.Equal(t, []int64{11, 12}, cache.ids)
 	require.Equal(t, wantStart, cache.start)
+}
+
+func TestUserWeeklyQuotaSyncEarlyUpstreamResetTriggersAfterConfirmation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	// Before the early reset, the source says that the current cycle ends on
+	// July 8. On July 3 the official window starts anew and therefore reports
+	// July 10 as the next reset: only a two-day reset_at advance.
+	baselineReset := now.Add(7 * 24 * time.Hour)
+	earlyWindowStart := now.Add(2 * 24 * time.Hour)
+	earlyReset := earlyWindowStart.Add(7 * 24 * time.Hour)
+	config := UserWeeklyQuotaSyncConfig{Enabled: true, SourceAccountID: 9, PollIntervalSeconds: 60}
+	configJSON, err := json.Marshal(config)
+	require.NoError(t, err)
+	settings := &weeklyQuotaSyncSettingRepo{values: map[string]string{
+		SettingKeyUserWeeklyQuotaSyncConfig: string(configJSON),
+	}}
+	accounts := &weeklyQuotaSyncAccountRepo{accounts: map[int64]*Account{
+		9: {ID: 9, Name: "Codex Pro", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive},
+	}}
+	resetter := &weeklyQuotaSyncResetter{ids: []int64{101}}
+	service := &UserWeeklyQuotaSyncService{
+		settingRepo:  settings,
+		accountRepo:  accounts,
+		quotaService: &weeklyQuotaSyncUsageReader{responses: []*OpenAIQuotaUsage{weeklyUsage(baselineReset), weeklyUsage(earlyReset), weeklyUsage(earlyReset)}},
+		bulkResetter: resetter,
+		instanceID:   "test-instance",
+		now:          func() time.Time { return now },
+	}
+
+	baseline, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, baseline.BaselineInitialized)
+
+	now = earlyWindowStart.Add(time.Minute)
+	pending, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, pending.AwaitingConfirmation)
+	require.Empty(t, resetter.starts)
+
+	now = now.Add(time.Minute)
+	triggered, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, triggered.ResetDetected)
+	require.Equal(t, []time.Time{earlyWindowStart}, resetter.starts)
+}
+
+func TestUserWeeklyQuotaSyncIgnoresOneOffChangedResetTime(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	baselineReset := now.Add(7 * 24 * time.Hour)
+	oneOffReset := baselineReset.Add(2 * 24 * time.Hour)
+	config := UserWeeklyQuotaSyncConfig{Enabled: true, SourceAccountID: 9, PollIntervalSeconds: 60}
+	configJSON, err := json.Marshal(config)
+	require.NoError(t, err)
+	settings := &weeklyQuotaSyncSettingRepo{values: map[string]string{
+		SettingKeyUserWeeklyQuotaSyncConfig: string(configJSON),
+	}}
+	accounts := &weeklyQuotaSyncAccountRepo{accounts: map[int64]*Account{
+		9: {ID: 9, Name: "Codex Pro", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive},
+	}}
+	resetter := &weeklyQuotaSyncResetter{ids: []int64{101}}
+	service := &UserWeeklyQuotaSyncService{
+		settingRepo:  settings,
+		accountRepo:  accounts,
+		quotaService: &weeklyQuotaSyncUsageReader{responses: []*OpenAIQuotaUsage{weeklyUsage(baselineReset), weeklyUsage(oneOffReset), weeklyUsage(baselineReset)}},
+		bulkResetter: resetter,
+		instanceID:   "test-instance",
+		now:          func() time.Time { return now },
+	}
+
+	_, err = service.CheckNow(ctx)
+	require.NoError(t, err)
+	now = now.Add(2*24*time.Hour + time.Minute)
+	pending, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, pending.AwaitingConfirmation)
+	now = now.Add(time.Minute)
+	stable, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.False(t, stable.ResetDetected)
+	require.Nil(t, stable.Status.State.PendingResetAt)
+	require.Empty(t, resetter.starts)
 }
 
 func TestUserWeeklyQuotaSyncResetAllAtResetsOnlyAffectedUsers(t *testing.T) {

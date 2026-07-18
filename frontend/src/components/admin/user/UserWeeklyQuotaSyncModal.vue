@@ -83,6 +83,14 @@
               {{ displayTime(status?.state.observed_reset_at) }}
             </dd>
           </div>
+          <div v-if="status?.state.pending_reset_at">
+            <dt class="text-xs text-amber-600 dark:text-amber-400">
+              {{ t('admin.users.weeklyQuotaSync.pendingResetAt') }}
+            </dt>
+            <dd class="mt-1 font-medium text-amber-700 dark:text-amber-300">
+              {{ displayTime(status.state.pending_reset_at) }}
+            </dd>
+          </div>
           <div>
             <dt class="text-xs text-gray-500 dark:text-gray-400">
               {{ t('admin.users.weeklyQuotaSync.windowStart') }}
@@ -320,6 +328,8 @@ async function handleCheck() {
       appStore.showSuccess(t('admin.users.weeklyQuotaSync.checkReset', { count: result.affected_users }))
     } else if (result.baseline_initialized) {
       appStore.showSuccess(t('admin.users.weeklyQuotaSync.checkBaseline'))
+    } else if (result.awaiting_confirmation) {
+      appStore.showSuccess(t('admin.users.weeklyQuotaSync.checkPending'))
     } else {
       appStore.showSuccess(t('admin.users.weeklyQuotaSync.checkComplete'))
     }

@@ -6,6 +6,7 @@ const apiMocks = vi.hoisted(() => ({
   getPlatformQuotas: vi.fn(),
   updatePlatformQuotas: vi.fn(),
   resetPlatformQuotaWindow: vi.fn(),
+  updatePlatformQuotaWeeklyWindowStart: vi.fn(),
 }))
 
 vi.mock('@/api/admin', () => ({
@@ -14,6 +15,7 @@ vi.mock('@/api/admin', () => ({
       getPlatformQuotas: apiMocks.getPlatformQuotas,
       updatePlatformQuotas: apiMocks.updatePlatformQuotas,
       resetPlatformQuotaWindow: apiMocks.resetPlatformQuotaWindow,
+      updatePlatformQuotaWeeklyWindowStart: apiMocks.updatePlatformQuotaWeeklyWindowStart,
     },
   },
 }))
@@ -71,6 +73,7 @@ beforeEach(() => {
   apiMocks.getPlatformQuotas.mockResolvedValue({ platform_quotas: [] })
   apiMocks.updatePlatformQuotas.mockResolvedValue({ platform_quotas: [] })
   apiMocks.resetPlatformQuotaWindow.mockResolvedValue({ platform_quotas: [] })
+  apiMocks.updatePlatformQuotaWeeklyWindowStart.mockResolvedValue({ platform_quotas: [] })
 })
 
 describe('UserPlatformQuotaModal', () => {
@@ -192,7 +195,7 @@ describe('UserPlatformQuotaModal', () => {
   it('重置周窗口时会提交管理员选择的滚动窗口起点', async () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
     const w = await mountAndOpen()
-    const startInput = w.find('#weekly-reset-start')
+    const startInput = w.find('#weekly-window-start')
     await startInput.setValue('2026-07-20T12:34')
 
     const resetBtns = w.findAll('button').filter((b) => b.text() === '↻')
@@ -205,6 +208,40 @@ describe('UserPlatformQuotaModal', () => {
       'weekly',
       new Date('2026-07-20T12:34').toISOString(),
     )
+    confirmSpy.mockRestore()
+  })
+
+  it('仅调整周窗口起始时间时保留用量并调用专用 API', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    apiMocks.getPlatformQuotas.mockResolvedValueOnce({
+      platform_quotas: [
+        { platform: 'anthropic', daily_limit_usd: null, weekly_limit_usd: 20, monthly_limit_usd: null,
+          daily_usage_usd: 0, weekly_usage_usd: 8.5, monthly_usage_usd: 0 },
+      ],
+    })
+    const w = await mountAndOpen()
+    const startInput = w.find('#weekly-window-start')
+    const localStart = new Date(Date.now() - 60 * 60 * 1000)
+    const value = [
+      localStart.getFullYear(),
+      String(localStart.getMonth() + 1).padStart(2, '0'),
+      String(localStart.getDate()).padStart(2, '0'),
+    ].join('-') + `T${String(localStart.getHours()).padStart(2, '0')}:${String(localStart.getMinutes()).padStart(2, '0')}`
+    await startInput.setValue(value)
+
+    const adjustButton = w.findAll('button').find((b) =>
+      b.text() === 'admin.users.platformQuota.adjustWeeklyStart.button'
+    )
+    expect(adjustButton).toBeTruthy()
+    await adjustButton!.trigger('click')
+    await flushPromises()
+
+    expect(apiMocks.updatePlatformQuotaWeeklyWindowStart).toHaveBeenCalledWith(
+      99,
+      'anthropic',
+      new Date(value).toISOString(),
+    )
+    expect(apiMocks.resetPlatformQuotaWindow).not.toHaveBeenCalled()
     confirmSpy.mockRestore()
   })
 
