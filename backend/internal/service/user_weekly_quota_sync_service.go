@@ -24,6 +24,15 @@ const (
 	userWeeklyQuotaSyncLeaderLockTTL       = 2 * time.Minute
 	userWeeklyQuotaSyncTargetWindow        = 7 * 24 * time.Hour
 	userWeeklyQuotaSyncWindowTolerance     = 24 * time.Hour
+	// The upstream countdown is rounded while a request is in flight. Treat
+	// small differences as the same boundary so ordinary second-level drift is
+	// never mistaken for an early official reset.
+	userWeeklyQuotaSyncBoundaryTolerance = 2 * time.Minute
+	// The account quota card uses the live Codex countdown. If reset_after_seconds
+	// disagrees materially with reset_at, use the countdown so synchronization
+	// follows the same real Codex window shown to the admin.
+	userWeeklyQuotaSyncResetAtTolerance  = 2 * time.Minute
+	userWeeklyQuotaSyncObservationSource = "codex_primary_reset_after_v1"
 )
 
 var (
@@ -56,6 +65,10 @@ type UserWeeklyQuotaSyncState struct {
 	SourceAccountID       int64      `json:"source_account_id"`
 	ObservedResetAt       *time.Time `json:"observed_reset_at,omitempty"`
 	ObservedWindowSeconds int64      `json:"observed_window_seconds,omitempty"`
+	// ObservedSource identifies the upstream signal used for the persisted
+	// baseline. Changing it deliberately starts a new baseline rather than
+	// treating a different quota window as a user-quota reset.
+	ObservedSource string `json:"observed_source,omitempty"`
 	// PendingResetAt is a newly observed upstream reset boundary that must be
 	// returned once more before a mass reset is allowed. Persisting it makes the
 	// confirmation survive service restarts and prevents one bad response from
@@ -470,14 +483,14 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 		_ = s.saveState(ctx, state)
 		return nil, err
 	}
-	weekly, err := findOpenAIWeeklyQuotaWindow(usage)
+	weekly, err := findOpenAIWeeklyQuotaSignal(usage, now)
 	if err != nil {
 		state.LastError = err.Error()
 		_ = s.saveState(ctx, state)
 		return nil, err
 	}
-	resetAt := time.Unix(weekly.ResetAt, 0).UTC()
-	windowStart := resetAt.Add(-time.Duration(weekly.LimitWindowSeconds) * time.Second).Truncate(time.Second)
+	resetAt := weekly.resetAt
+	windowStart := resetAt.Add(-time.Duration(weekly.windowSeconds) * time.Second).Truncate(time.Second)
 	if windowStart.After(now.Add(5 * time.Minute)) {
 		err := fmt.Errorf("upstream seven-day reset time is invalid")
 		state.LastError = err.Error()
@@ -486,9 +499,10 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 	}
 
 	result := &UserWeeklyQuotaSyncCheckResult{ResetAt: resetAt, WindowStart: windowStart}
-	if state.ObservedResetAt == nil || sourceChanged {
+	if state.ObservedResetAt == nil || sourceChanged || state.ObservedSource != weekly.source {
 		state.ObservedResetAt = &resetAt
-		state.ObservedWindowSeconds = weekly.LimitWindowSeconds
+		state.ObservedWindowSeconds = weekly.windowSeconds
+		state.ObservedSource = weekly.source
 		state.PendingResetAt = nil
 		state.LastError = ""
 		if err := s.saveState(ctx, state); err != nil {
@@ -504,7 +518,7 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 		// second consecutive observation of the exact same new reset_at before
 		// applying it. This still accepts early official resets: there is no
 		// "half of a seven-day window" threshold here.
-		if state.PendingResetAt == nil || !resetAt.Equal(*state.PendingResetAt) {
+		if state.PendingResetAt == nil || !sameUpstreamWeeklyBoundary(resetAt, *state.PendingResetAt) {
 			state.PendingResetAt = &resetAt
 			state.LastError = ""
 			if err := s.saveState(ctx, state); err != nil {
@@ -531,9 +545,10 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 	// Do not replace the last confirmed observation with a backward timestamp:
 	// an inconsistent upstream response must never make a later real reset look
 	// old. An equal timestamp is still allowed to refresh the window metadata.
-	if !resetAt.Before(*state.ObservedResetAt) {
+	if !resetAt.Before(*state.ObservedResetAt) || sameUpstreamWeeklyBoundary(resetAt, *state.ObservedResetAt) {
 		state.ObservedResetAt = &resetAt
-		state.ObservedWindowSeconds = weekly.LimitWindowSeconds
+		state.ObservedWindowSeconds = weekly.windowSeconds
+		state.ObservedSource = weekly.source
 	}
 	state.PendingResetAt = nil
 	state.LastError = ""
@@ -565,7 +580,65 @@ func (s *UserWeeklyQuotaSyncService) currentTime() time.Time {
 }
 
 func upstreamWeeklyWindowAdvanced(previous, current time.Time) bool {
-	return current.After(previous)
+	return current.After(previous.Add(userWeeklyQuotaSyncBoundaryTolerance))
+}
+
+func sameUpstreamWeeklyBoundary(left, right time.Time) bool {
+	delta := left.Sub(right)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= userWeeklyQuotaSyncBoundaryTolerance
+}
+
+type openAIWeeklyQuotaSignal struct {
+	resetAt       time.Time
+	windowSeconds int64
+	source        string
+}
+
+// findOpenAIWeeklyQuotaSignal uses the primary seven-day limit returned by the
+// Codex /wham/usage request. reset_after_seconds is authoritative when reset_at
+// is inconsistent with the live countdown; this keeps the synchronizer aligned
+// with the reset duration displayed on the source account card.
+func findOpenAIWeeklyQuotaSignal(usage *OpenAIQuotaUsage, fallbackNow time.Time) (*openAIWeeklyQuotaSignal, error) {
+	weekly, err := findOpenAIWeeklyQuotaWindow(usage)
+	if err != nil {
+		return nil, err
+	}
+
+	observedAt := fallbackNow.UTC().Truncate(time.Second)
+	if usage.FetchedAt > 0 {
+		observedAt = time.Unix(usage.FetchedAt, 0).UTC()
+	}
+
+	var resetAt time.Time
+	if weekly.ResetAt > 0 {
+		resetAt = time.Unix(weekly.ResetAt, 0).UTC()
+	}
+	if weekly.ResetAfterSeconds > 0 {
+		fromCountdown := observedAt.Add(time.Duration(weekly.ResetAfterSeconds) * time.Second).Truncate(time.Second)
+		if resetAt.IsZero() || !sameWeeklyResetTime(resetAt, fromCountdown) {
+			resetAt = fromCountdown
+		}
+	}
+	if resetAt.IsZero() {
+		return nil, ErrUserWeeklyQuotaSyncNoWeeklyLimit
+	}
+
+	return &openAIWeeklyQuotaSignal{
+		resetAt:       resetAt.Truncate(time.Second),
+		windowSeconds: weekly.LimitWindowSeconds,
+		source:        userWeeklyQuotaSyncObservationSource,
+	}, nil
+}
+
+func sameWeeklyResetTime(left, right time.Time) bool {
+	delta := left.Sub(right)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= userWeeklyQuotaSyncResetAtTolerance
 }
 
 func findOpenAIWeeklyQuotaWindow(usage *OpenAIQuotaUsage) (*OpenAIRateLimitWindow, error) {
@@ -574,16 +647,15 @@ func findOpenAIWeeklyQuotaWindow(usage *OpenAIQuotaUsage) (*OpenAIRateLimitWindo
 	}
 	type candidate struct {
 		window   *OpenAIRateLimitWindow
-		priority int
 		distance time.Duration
 	}
-	candidates := make([]candidate, 0, 8)
-	add := func(limit *OpenAIRateLimit, priority int) {
+	candidates := make([]candidate, 0, 2)
+	add := func(limit *OpenAIRateLimit) {
 		if limit == nil {
 			return
 		}
 		for _, window := range []*OpenAIRateLimitWindow{limit.PrimaryWindow, limit.SecondaryWindow} {
-			if window == nil || window.ResetAt <= 0 || window.LimitWindowSeconds <= 0 {
+			if window == nil || window.LimitWindowSeconds <= 0 || (window.ResetAt <= 0 && window.ResetAfterSeconds <= 0) {
 				continue
 			}
 			duration := time.Duration(window.LimitWindowSeconds) * time.Second
@@ -594,26 +666,30 @@ func findOpenAIWeeklyQuotaWindow(usage *OpenAIQuotaUsage) (*OpenAIRateLimitWindo
 			if distance > userWeeklyQuotaSyncWindowTolerance {
 				continue
 			}
-			candidates = append(candidates, candidate{window: window, priority: priority, distance: distance})
+			candidates = append(candidates, candidate{window: window, distance: distance})
 		}
 	}
-	// A Codex-specific additional limit is the best signal for the requested
-	// Codex account, but retain the base account rate limit as a fallback.
-	for _, additional := range usage.AdditionalRateLimits {
-		priority := 2
-		if strings.Contains(strings.ToLower(additional.MeteredFeature+" "+additional.LimitName), "codex") {
-			priority = 0
+	// The primary rate_limit belongs to the Codex request made by QueryUsage and
+	// is the same quota family represented by the source account card. Additional
+	// limits can represent independent products, so never prefer them merely
+	// because their names contain "codex". Keep one exact fallback for accounts
+	// where the primary envelope has no seven-day window.
+	add(usage.RateLimit)
+	if len(candidates) == 0 {
+		for _, additional := range usage.AdditionalRateLimits {
+			if strings.EqualFold(strings.TrimSpace(additional.MeteredFeature), "codex_bengalfox") {
+				add(additional.RateLimit)
+				break
+			}
 		}
-		add(additional.RateLimit, priority)
 	}
-	add(usage.RateLimit, 1)
 	if len(candidates) == 0 {
 		return nil, ErrUserWeeklyQuotaSyncNoWeeklyLimit
 	}
 	best := candidates[0]
 	for _, candidate := range candidates[1:] {
-		if candidate.priority < best.priority || (candidate.priority == best.priority && candidate.distance < best.distance) ||
-			(candidate.priority == best.priority && candidate.distance == best.distance && candidate.window.ResetAt > best.window.ResetAt) {
+		if candidate.distance < best.distance ||
+			(candidate.distance == best.distance && candidate.window.ResetAt > best.window.ResetAt) {
 			best = candidate
 		}
 	}

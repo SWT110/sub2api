@@ -370,6 +370,7 @@ export interface UserWeeklyQuotaSyncState {
   source_account_id: number
   observed_reset_at?: string | null
   observed_window_seconds?: number | null
+  observed_source?: string | null
   pending_reset_at?: string | null
   last_checked_at?: string | null
   last_triggered_at?: string | null

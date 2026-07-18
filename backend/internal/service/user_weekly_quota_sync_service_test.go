@@ -96,9 +96,9 @@ func weeklyUsage(resetAt time.Time) *OpenAIQuotaUsage {
 	}
 }
 
-func TestFindOpenAIWeeklyQuotaWindowPrefersCodexAdditionalLimit(t *testing.T) {
+func TestFindOpenAIWeeklyQuotaWindowUsesPrimaryBeforeIndependentAdditionalLimit(t *testing.T) {
 	baseReset := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
-	codexReset := baseReset.Add(time.Hour)
+	additionalReset := baseReset.Add(time.Hour)
 	usage := &OpenAIQuotaUsage{
 		RateLimit: &OpenAIRateLimit{
 			PrimaryWindow: &OpenAIRateLimitWindow{LimitWindowSeconds: int64((7 * 24 * time.Hour).Seconds()), ResetAt: baseReset.Unix()},
@@ -107,14 +107,54 @@ func TestFindOpenAIWeeklyQuotaWindowPrefersCodexAdditionalLimit(t *testing.T) {
 			MeteredFeature: "codex_bengalfox",
 			RateLimit: &OpenAIRateLimit{SecondaryWindow: &OpenAIRateLimitWindow{
 				LimitWindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
-				ResetAt:            codexReset.Unix(),
+				ResetAt:            additionalReset.Unix(),
 			}},
 		}},
 	}
 
 	window, err := findOpenAIWeeklyQuotaWindow(usage)
 	require.NoError(t, err)
-	require.Equal(t, codexReset.Unix(), window.ResetAt)
+	require.Equal(t, baseReset.Unix(), window.ResetAt)
+}
+
+func TestFindOpenAIWeeklyQuotaWindowFallsBackToBengalfox(t *testing.T) {
+	resetAt := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	usage := &OpenAIQuotaUsage{
+		RateLimit: &OpenAIRateLimit{
+			PrimaryWindow: &OpenAIRateLimitWindow{LimitWindowSeconds: 5 * 60 * 60, ResetAt: resetAt.Unix()},
+		},
+		AdditionalRateLimits: []OpenAIAdditionalRateLimit{{
+			MeteredFeature: "codex_bengalfox",
+			RateLimit: &OpenAIRateLimit{SecondaryWindow: &OpenAIRateLimitWindow{
+				LimitWindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+				ResetAt:            resetAt.Unix(),
+			}},
+		}},
+	}
+
+	window, err := findOpenAIWeeklyQuotaWindow(usage)
+	require.NoError(t, err)
+	require.Equal(t, resetAt.Unix(), window.ResetAt)
+}
+
+func TestFindOpenAIWeeklyQuotaSignalUsesCountdownWhenResetAtDisagrees(t *testing.T) {
+	fetchedAt := time.Date(2026, 7, 18, 12, 59, 23, 0, time.UTC)
+	wantReset := fetchedAt.Add(6*24*time.Hour + 14*time.Hour + 25*time.Minute + 38*time.Second)
+	usage := &OpenAIQuotaUsage{
+		FetchedAt: fetchedAt.Unix(),
+		RateLimit: &OpenAIRateLimit{PrimaryWindow: &OpenAIRateLimitWindow{
+			LimitWindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+			// This mirrors the observed upstream inconsistency: reset_at says a
+			// different window, while reset_after_seconds matches the live card.
+			ResetAt:           fetchedAt.Add(7 * 24 * time.Hour).Unix(),
+			ResetAfterSeconds: int64(wantReset.Sub(fetchedAt).Seconds()),
+		}},
+	}
+
+	signal, err := findOpenAIWeeklyQuotaSignal(usage, fetchedAt.Add(-time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, wantReset, signal.resetAt)
+	require.Equal(t, int64((7 * time.Hour * 24).Seconds()), signal.windowSeconds)
 }
 
 func TestUserWeeklyQuotaSyncCheckBaselinesThenConfirmsAndResetsUsers(t *testing.T) {
@@ -252,6 +292,99 @@ func TestUserWeeklyQuotaSyncIgnoresOneOffChangedResetTime(t *testing.T) {
 	require.False(t, stable.ResetDetected)
 	require.Nil(t, stable.Status.State.PendingResetAt)
 	require.Empty(t, resetter.starts)
+}
+
+func TestUserWeeklyQuotaSyncMigratesLegacyObservationWithoutReset(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 12, 59, 23, 0, time.UTC)
+	legacyObserved := now.Add(7 * 24 * time.Hour)
+	matchedCardReset := now.Add(6*24*time.Hour + 14*time.Hour + 25*time.Minute + 38*time.Second)
+	config := UserWeeklyQuotaSyncConfig{Enabled: true, SourceAccountID: 9, PollIntervalSeconds: 60}
+	configJSON, err := json.Marshal(config)
+	require.NoError(t, err)
+	legacyStateJSON, err := json.Marshal(UserWeeklyQuotaSyncState{
+		SourceAccountID:       9,
+		ObservedResetAt:       &legacyObserved,
+		ObservedWindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+		PendingResetAt:        &legacyObserved,
+	})
+	require.NoError(t, err)
+	settings := &weeklyQuotaSyncSettingRepo{values: map[string]string{
+		SettingKeyUserWeeklyQuotaSyncConfig: string(configJSON),
+		SettingKeyUserWeeklyQuotaSyncState:  string(legacyStateJSON),
+	}}
+	accounts := &weeklyQuotaSyncAccountRepo{accounts: map[int64]*Account{
+		9: {ID: 9, Name: "Codex Pro", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive},
+	}}
+	usage := &OpenAIQuotaUsage{
+		FetchedAt: now.Unix(),
+		RateLimit: &OpenAIRateLimit{PrimaryWindow: &OpenAIRateLimitWindow{
+			LimitWindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+			ResetAt:            legacyObserved.Unix(),
+			ResetAfterSeconds:  int64(matchedCardReset.Sub(now).Seconds()),
+		}},
+	}
+	resetter := &weeklyQuotaSyncResetter{ids: []int64{101}}
+	service := &UserWeeklyQuotaSyncService{
+		settingRepo:  settings,
+		accountRepo:  accounts,
+		quotaService: &weeklyQuotaSyncUsageReader{responses: []*OpenAIQuotaUsage{usage}},
+		bulkResetter: resetter,
+		instanceID:   "test-instance",
+		now:          func() time.Time { return now },
+	}
+
+	result, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, result.BaselineInitialized)
+	require.False(t, result.ResetDetected)
+	require.Empty(t, resetter.starts)
+	require.NotNil(t, result.Status.State.ObservedResetAt)
+	require.Equal(t, matchedCardReset, *result.Status.State.ObservedResetAt)
+	require.Equal(t, userWeeklyQuotaSyncObservationSource, result.Status.State.ObservedSource)
+	require.Nil(t, result.Status.State.PendingResetAt)
+}
+
+func TestUserWeeklyQuotaSyncConfirmsBoundaryDespiteCountdownSecondDrift(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	firstReset := now.Add(7 * 24 * time.Hour)
+	secondWindowStart := now.Add(2 * 24 * time.Hour)
+	secondReset := secondWindowStart.Add(7 * 24 * time.Hour)
+	config := UserWeeklyQuotaSyncConfig{Enabled: true, SourceAccountID: 9, PollIntervalSeconds: 60}
+	configJSON, err := json.Marshal(config)
+	require.NoError(t, err)
+	settings := &weeklyQuotaSyncSettingRepo{values: map[string]string{
+		SettingKeyUserWeeklyQuotaSyncConfig: string(configJSON),
+	}}
+	accounts := &weeklyQuotaSyncAccountRepo{accounts: map[int64]*Account{
+		9: {ID: 9, Name: "Codex Pro", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive},
+	}}
+	resetter := &weeklyQuotaSyncResetter{ids: []int64{101}}
+	service := &UserWeeklyQuotaSyncService{
+		settingRepo: settings,
+		accountRepo: accounts,
+		quotaService: &weeklyQuotaSyncUsageReader{responses: []*OpenAIQuotaUsage{
+			weeklyUsage(firstReset),
+			weeklyUsage(secondReset),
+			weeklyUsage(secondReset.Add(-time.Second)),
+		}},
+		bulkResetter: resetter,
+		instanceID:   "test-instance",
+		now:          func() time.Time { return now },
+	}
+
+	_, err = service.CheckNow(ctx)
+	require.NoError(t, err)
+	now = secondWindowStart.Add(time.Minute)
+	pending, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, pending.AwaitingConfirmation)
+	now = now.Add(time.Minute)
+	triggered, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, triggered.ResetDetected)
+	require.Len(t, resetter.starts, 1)
 }
 
 func TestUserWeeklyQuotaSyncResetAllAtResetsOnlyAffectedUsers(t *testing.T) {
