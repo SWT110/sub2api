@@ -186,17 +186,17 @@ func TestUserPlatformQuotaRepository_IncrementUsageWithReset_WeeklyReset(t *test
 
 	repo := NewUserPlatformQuotaRepository(client)
 
-	// 5月22日（周五）和 5月25日（下周一），不同周
+	// 5月22日（周五）和 7 天后的 5月29日，滚动窗口应重置。
 	fri := time.Date(2026, 5, 22, 10, 0, 0, 0, time.UTC)
-	nextMon := time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC) // 下一周周一
+	nextWeek := fri.Add(7 * 24 * time.Hour)
 
 	require.NoError(t, repo.IncrementUsageWithReset(ctx, userID, "openai", 5.0, fri))
-	require.NoError(t, repo.IncrementUsageWithReset(ctx, userID, "openai", 2.0, nextMon))
+	require.NoError(t, repo.IncrementUsageWithReset(ctx, userID, "openai", 2.0, nextWeek))
 
 	rec, err := repo.GetByUserPlatform(ctx, userID, "openai")
 	require.NoError(t, err)
 	require.InDelta(t, 2.0, rec.DailyUsageUSD, 1e-9, "daily resets to new cost")
-	require.InDelta(t, 2.0, rec.WeeklyUsageUSD, 1e-9, "weekly resets (new week)")
+	require.InDelta(t, 2.0, rec.WeeklyUsageUSD, 1e-9, "weekly resets after seven rolling days")
 	require.InDelta(t, 7.0, rec.MonthlyUsageUSD, 1e-9, "monthly accumulates (same month)")
 }
 

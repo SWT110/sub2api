@@ -88,6 +88,14 @@ type BillingCache interface {
 	BatchGetUserPlatformQuotaCache(ctx context.Context, keys []UserPlatformQuotaKey) ([]*UserPlatformQuotaCacheEntry, error)
 }
 
+// UserPlatformQuotaWeeklyCacheResetter is an optional capability implemented
+// by the production Redis cache. Keeping it separate from BillingCache avoids
+// forcing every narrow test double to implement a bulk-only administrative
+// operation.
+type UserPlatformQuotaWeeklyCacheResetter interface {
+	ResetUserPlatformQuotaWeeklyCache(ctx context.Context, userIDs []int64, platform string, newStart time.Time) error
+}
+
 // ModelPricing 模型价格配置（per-token价格，与LiteLLM格式一致）
 type ModelPricing struct {
 	InputPricePerToken                 float64 // 每token输入价格 (USD)

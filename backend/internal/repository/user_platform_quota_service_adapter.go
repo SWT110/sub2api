@@ -94,6 +94,14 @@ func (a *userPlatformQuotaServiceAdapter) ResetExpiredWindow(ctx context.Context
 	return err
 }
 
+// ResetWeeklyWindowForPlatform exposes the optional bulk-reset capability used
+// by the Codex weekly quota synchronizer. It intentionally stays outside the
+// base service repository port so existing focused fakes do not need a method
+// they never call.
+func (a *userPlatformQuotaServiceAdapter) ResetWeeklyWindowForPlatform(ctx context.Context, platform string, newStart time.Time) ([]int64, error) {
+	return a.inner.ResetWeeklyWindowForPlatform(ctx, platform, newStart)
+}
+
 // BatchSnapshotUsage 转换 []service.UserPlatformQuotaSnapshot → []UserPlatformQuotaSnapshot，
 // 调底层 repo，并将 repository FK sentinel 包装为 service sentinel。
 func (a *userPlatformQuotaServiceAdapter) BatchSnapshotUsage(ctx context.Context, snapshots []service.UserPlatformQuotaSnapshot, now time.Time) error {

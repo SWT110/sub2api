@@ -360,6 +360,49 @@ export interface PlatformQuotasResponse {
   platform_quotas: PlatformQuotaItem[]
 }
 
+export interface UserWeeklyQuotaSyncConfig {
+  enabled: boolean
+  source_account_id: number
+  poll_interval_seconds: number
+}
+
+export interface UserWeeklyQuotaSyncState {
+  source_account_id: number
+  observed_reset_at?: string | null
+  observed_window_seconds?: number | null
+  last_checked_at?: string | null
+  last_triggered_at?: string | null
+  last_window_start?: string | null
+  last_affected_users: number
+  last_error?: string | null
+}
+
+export interface UserWeeklyQuotaSyncStatus {
+  config: UserWeeklyQuotaSyncConfig
+  state: UserWeeklyQuotaSyncState
+}
+
+export interface UserWeeklyQuotaSyncSourceAccount {
+  id: number
+  name: string
+  status: string
+  eligible: boolean
+}
+
+export interface UserWeeklyQuotaSyncCheckResult {
+  baseline_initialized: boolean
+  reset_detected: boolean
+  reset_at: string
+  window_start: string
+  affected_users: number
+  status: UserWeeklyQuotaSyncStatus
+}
+
+export interface UserWeeklyQuotaSyncResetResult {
+  affected_users: number
+  window_start: string
+}
+
 /**
  * Get user's platform quotas
  */
@@ -390,11 +433,61 @@ export async function updatePlatformQuotas(
 export async function resetPlatformQuotaWindow(
   id: number,
   platform: PlatformQuotaPlatform,
-  window: PlatformQuotaWindow
+  window: PlatformQuotaWindow,
+  startAt?: string
 ): Promise<PlatformQuotasResponse> {
+  const payload: { platform: PlatformQuotaPlatform; window: PlatformQuotaWindow; start_at?: string } = {
+    platform,
+    window
+  }
+  if (startAt) payload.start_at = startAt
   const { data } = await apiClient.post<PlatformQuotasResponse>(
     `/admin/users/${id}/platform-quotas/reset`,
-    { platform, window }
+    payload
+  )
+  return data
+}
+
+/** Get the optional OpenAI/Codex weekly-window synchronization configuration. */
+export async function getUserWeeklyQuotaSyncStatus(): Promise<UserWeeklyQuotaSyncStatus> {
+  const { data } = await apiClient.get<UserWeeklyQuotaSyncStatus>('/admin/user-weekly-quota-sync')
+  return data
+}
+
+/** Update the source account and automatic polling configuration. */
+export async function updateUserWeeklyQuotaSyncConfig(
+  config: UserWeeklyQuotaSyncConfig
+): Promise<UserWeeklyQuotaSyncStatus> {
+  const { data } = await apiClient.put<UserWeeklyQuotaSyncStatus>(
+    '/admin/user-weekly-quota-sync',
+    config
+  )
+  return data
+}
+
+/** List the active OpenAI OAuth accounts that may be used as a source. */
+export async function listUserWeeklyQuotaSyncSourceAccounts(): Promise<UserWeeklyQuotaSyncSourceAccount[]> {
+  const { data } = await apiClient.get<{ accounts: UserWeeklyQuotaSyncSourceAccount[] }>(
+    '/admin/user-weekly-quota-sync/source-accounts'
+  )
+  return data.accounts || []
+}
+
+/** Query the source account immediately and reset users when an upstream reset is detected. */
+export async function checkUserWeeklyQuotaSyncNow(): Promise<UserWeeklyQuotaSyncCheckResult> {
+  const { data } = await apiClient.post<UserWeeklyQuotaSyncCheckResult>(
+    '/admin/user-weekly-quota-sync/check'
+  )
+  return data
+}
+
+/** Explicitly reset all configured OpenAI weekly quota windows at one anchor time. */
+export async function resetAllUserWeeklyQuotaSyncAt(
+  startAt: string
+): Promise<UserWeeklyQuotaSyncResetResult> {
+  const { data } = await apiClient.post<UserWeeklyQuotaSyncResetResult>(
+    '/admin/user-weekly-quota-sync/reset',
+    { start_at: startAt }
   )
   return data
 }
@@ -417,6 +510,11 @@ export const usersAPI = {
   getPlatformQuotas,
   updatePlatformQuotas,
   resetPlatformQuotaWindow,
+  getUserWeeklyQuotaSyncStatus,
+  updateUserWeeklyQuotaSyncConfig,
+  listUserWeeklyQuotaSyncSourceAccounts,
+  checkUserWeeklyQuotaSyncNow,
+  resetAllUserWeeklyQuotaSyncAt,
 }
 
 export default usersAPI

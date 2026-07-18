@@ -9,6 +9,7 @@ import (
 type AdminHandlers struct {
 	Dashboard              *admin.DashboardHandler
 	User                   *admin.UserHandler
+	WeeklyQuotaSync        *admin.UserWeeklyQuotaSyncHandler
 	Group                  *admin.GroupHandler
 	Account                *admin.AccountHandler
 	Announcement           *admin.AnnouncementHandler

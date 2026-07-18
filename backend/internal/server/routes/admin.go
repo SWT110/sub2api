@@ -32,6 +32,7 @@ func RegisterAdminRoutes(
 
 		// 用户管理
 		registerUserManagementRoutes(admin, h)
+		registerUserWeeklyQuotaSyncRoutes(admin, h)
 
 		// 分组管理
 		registerGroupRoutes(admin, h)
@@ -302,6 +303,17 @@ func registerUserManagementRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		// User attribute values
 		users.GET("/:id/attributes", h.Admin.UserAttribute.GetUserAttributes)
 		users.PUT("/:id/attributes", h.Admin.UserAttribute.UpdateUserAttributes)
+	}
+}
+
+func registerUserWeeklyQuotaSyncRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	sync := admin.Group("/user-weekly-quota-sync")
+	{
+		sync.GET("", h.Admin.WeeklyQuotaSync.GetStatus)
+		sync.PUT("", h.Admin.WeeklyQuotaSync.UpdateConfig)
+		sync.GET("/source-accounts", h.Admin.WeeklyQuotaSync.ListSourceAccounts)
+		sync.POST("/check", h.Admin.WeeklyQuotaSync.CheckNow)
+		sync.POST("/reset", h.Admin.WeeklyQuotaSync.ResetAllAt)
 	}
 }
 

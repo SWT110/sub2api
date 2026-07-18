@@ -750,11 +750,30 @@ var ProviderSet = wire.NewSet(
 	ProvideChannelMonitorRunner,
 	NewChannelMonitorRequestTemplateService,
 	ProvideUserPlatformQuotaUsageFlusher,
+	ProvideUserWeeklyQuotaSyncService,
 )
 
 // ProvideUserPlatformQuotaUsageFlusher 创建并启动 UserPlatformQuotaUsageFlusher。
 func ProvideUserPlatformQuotaUsageFlusher(cfg *config.Config, cache BillingCache, quotaRepo UserPlatformQuotaRepository, tw *TimingWheelService) *UserPlatformQuotaUsageFlusher {
 	svc := NewUserPlatformQuotaUsageFlusher(cfg, cache, quotaRepo, tw)
+	svc.Start()
+	return svc
+}
+
+// ProvideUserWeeklyQuotaSyncService starts the optional Codex-window monitor.
+// The service itself stays inert until an admin selects a source account and
+// enables the persisted configuration.
+func ProvideUserWeeklyQuotaSyncService(
+	settingRepo SettingRepository,
+	accountRepo AccountRepository,
+	quotaService *OpenAIQuotaService,
+	quotaRepo UserPlatformQuotaRepository,
+	cache BillingCache,
+	lockCache LeaderLockCache,
+	db *sql.DB,
+) *UserWeeklyQuotaSyncService {
+	svc := NewUserWeeklyQuotaSyncService(settingRepo, accountRepo, quotaService, quotaRepo, cache)
+	svc.SetLeaderLock(lockCache, db)
 	svc.Start()
 	return svc
 }

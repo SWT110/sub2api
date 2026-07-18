@@ -15,6 +15,22 @@
       <p class="text-sm text-gray-600 dark:text-gray-400">
         {{ t('admin.users.platformQuota.subtitle', { email: user.email }) }}
       </p>
+      <div class="flex flex-wrap items-end gap-3 border-b border-gray-200 pb-4 dark:border-dark-700">
+        <div class="min-w-0 flex-1">
+          <label for="weekly-reset-start" class="input-label">
+            {{ t('admin.users.platformQuota.weeklyStartAt') }}
+          </label>
+          <input
+            id="weekly-reset-start"
+            v-model="weeklyResetStart"
+            type="datetime-local"
+            class="input w-full sm:max-w-xs"
+          />
+        </div>
+        <p class="max-w-sm text-xs text-gray-500 dark:text-gray-400">
+          {{ t('admin.users.platformQuota.weeklyStartAtHint') }}
+        </p>
+      </div>
       <div v-if="loading" class="py-10 text-center text-gray-500">{{ t('common.loading') }}</div>
       <div v-else class="overflow-x-auto">
         <table class="min-w-full text-sm">
@@ -148,6 +164,7 @@ const loading = ref(false)
 const submitting = ref(false)
 const resetting = reactive<Record<string, boolean>>({})
 const quotas = ref<QuotaRow[]>([])
+const weeklyResetStart = ref('')
 
 function emptyRow(p: PlatformQuotaPlatform): QuotaRow {
   return {
@@ -200,7 +217,12 @@ async function load() {
 
 watch(
   () => props.show,
-  (s) => { if (s && props.user) load() },
+  (s) => {
+    if (s && props.user) {
+      weeklyResetStart.value = ''
+      load()
+    }
+  },
 )
 
 function onClearAll() {
@@ -263,6 +285,15 @@ function normalizeLimit(v: number | null | undefined): number | null {
 
 async function onReset(platform: PlatformQuotaPlatform, quotaWindow: PlatformQuotaWindow) {
   if (!props.user) return
+  let startAt: string | undefined
+  if (quotaWindow === 'weekly' && weeklyResetStart.value) {
+    const parsed = new Date(weeklyResetStart.value)
+    if (Number.isNaN(parsed.getTime())) {
+      appStore.showError(t('admin.users.platformQuota.weeklyStartAtInvalid'))
+      return
+    }
+    startAt = parsed.toISOString()
+  }
   const windowLabel = t(`admin.users.platformQuota.window${quotaWindow.charAt(0).toUpperCase() + quotaWindow.slice(1)}`)
   const confirmed = window.confirm(
     t('admin.users.platformQuota.reset.confirm', { platform, window: windowLabel })
@@ -271,7 +302,9 @@ async function onReset(platform: PlatformQuotaPlatform, quotaWindow: PlatformQuo
   const key = `${platform}.${quotaWindow}`
   resetting[key] = true
   try {
-    const data = await adminAPI.users.resetPlatformQuotaWindow(props.user.id, platform, quotaWindow)
+    const data = startAt
+      ? await adminAPI.users.resetPlatformQuotaWindow(props.user.id, platform, quotaWindow, startAt)
+      : await adminAPI.users.resetPlatformQuotaWindow(props.user.id, platform, quotaWindow)
     quotas.value = normalize(data.platform_quotas || [])
     appStore.showSuccess(t('admin.users.platformQuota.reset.success', { platform, window: windowLabel }))
   } catch (e: any) {

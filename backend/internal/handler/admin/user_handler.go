@@ -890,6 +890,10 @@ func (h *UserHandler) UpdateUserPlatformQuotas(c *gin.Context) {
 type ResetUserPlatformQuotaWindowRequest struct {
 	Platform string `json:"platform" binding:"required"`
 	Window   string `json:"window" binding:"required"`
+	// StartAt is accepted only for rolling weekly windows. It lets an admin
+	// explicitly align a user's next seven-day quota window with an upstream
+	// account reset instead of always anchoring it at click time.
+	StartAt *string `json:"start_at,omitempty"`
 }
 
 var allowedWindowsForQuotaReset = map[string]struct{}{
@@ -933,8 +937,25 @@ func (h *UserHandler) ResetUserPlatformQuotaWindow(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
-	now := time.Now().UTC()
-	if err := h.userPlatformQuotaRepo.ResetExpiredWindow(ctx, userID, req.Platform, req.Window, now); err != nil {
+	now := time.Now().UTC().Truncate(time.Second)
+	newStart := now
+	if req.StartAt != nil && strings.TrimSpace(*req.StartAt) != "" {
+		if req.Window != "weekly" {
+			response.BadRequest(c, "start_at is only supported for weekly quota resets")
+			return
+		}
+		parsed, parseErr := time.Parse(time.RFC3339, strings.TrimSpace(*req.StartAt))
+		if parseErr != nil {
+			response.BadRequest(c, "start_at must be RFC3339")
+			return
+		}
+		newStart = parsed.UTC().Truncate(time.Second)
+		if newStart.After(now) {
+			response.BadRequest(c, "start_at cannot be in the future")
+			return
+		}
+	}
+	if err := h.userPlatformQuotaRepo.ResetExpiredWindow(ctx, userID, req.Platform, req.Window, newStart); err != nil {
 		if errors.Is(err, service.ErrUserPlatformQuotaNotFound) {
 			response.NotFound(c, "user platform quota not found")
 			return
@@ -947,10 +968,20 @@ func (h *UserHandler) ResetUserPlatformQuotaWindow(c *gin.Context) {
 		"actor_admin_id", getAdminIDFromContext(c),
 		"target_user_id", userID,
 		"platform", req.Platform,
-		"window", req.Window)
+		"window", req.Window,
+		"window_start", newStart)
 
 	if h.billingCache != nil {
-		if err := h.billingCache.DeleteUserPlatformQuotaCache(ctx, userID, req.Platform); err != nil {
+		if req.Window == "weekly" {
+			if resetter, ok := h.billingCache.(service.UserPlatformQuotaWeeklyCacheResetter); ok {
+				if err := resetter.ResetUserPlatformQuotaWeeklyCache(ctx, []int64{userID}, req.Platform, newStart); err != nil {
+					slog.Error("ALERT: weekly quota cache reset failed; falling back to invalidation", "user_id", userID, "platform", req.Platform, "err", err)
+					_ = h.billingCache.DeleteUserPlatformQuotaCache(ctx, userID, req.Platform)
+				}
+			} else if err := h.billingCache.DeleteUserPlatformQuotaCache(ctx, userID, req.Platform); err != nil {
+				slog.Error("ALERT: quota cache invalidation failed after ResetExpiredWindow; 窗口重置可能延迟至 sentinel TTL(最长 1h)", "user_id", userID, "platform", req.Platform, "err", err)
+			}
+		} else if err := h.billingCache.DeleteUserPlatformQuotaCache(ctx, userID, req.Platform); err != nil {
 			slog.Error("ALERT: quota cache invalidation failed after ResetExpiredWindow; 窗口重置可能延迟至 sentinel TTL(最长 1h)", "user_id", userID, "platform", req.Platform, "err", err)
 		}
 	}

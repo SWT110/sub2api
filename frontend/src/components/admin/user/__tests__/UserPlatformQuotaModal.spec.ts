@@ -189,6 +189,25 @@ describe('UserPlatformQuotaModal', () => {
     confirmSpy.mockRestore()
   })
 
+  it('重置周窗口时会提交管理员选择的滚动窗口起点', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const w = await mountAndOpen()
+    const startInput = w.find('#weekly-reset-start')
+    await startInput.setValue('2026-07-20T12:34')
+
+    const resetBtns = w.findAll('button').filter((b) => b.text() === '↻')
+    await resetBtns[1].trigger('click') // anthropic.weekly
+    await flushPromises()
+
+    expect(apiMocks.resetPlatformQuotaWindow).toHaveBeenCalledWith(
+      99,
+      'anthropic',
+      'weekly',
+      new Date('2026-07-20T12:34').toISOString(),
+    )
+    confirmSpy.mockRestore()
+  })
+
   describe('subscription warning banner', () => {
     it('displays subscription warning when user has active subscription', async () => {
       const w = mount(UserPlatformQuotaModal, {

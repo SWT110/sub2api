@@ -13,6 +13,7 @@ import (
 func ProvideAdminHandlers(
 	dashboardHandler *admin.DashboardHandler,
 	userHandler *admin.UserHandler,
+	weeklyQuotaSyncHandler *admin.UserWeeklyQuotaSyncHandler,
 	groupHandler *admin.GroupHandler,
 	accountHandler *admin.AccountHandler,
 	announcementHandler *admin.AnnouncementHandler,
@@ -51,6 +52,7 @@ func ProvideAdminHandlers(
 	return &AdminHandlers{
 		Dashboard:              dashboardHandler,
 		User:                   userHandler,
+		WeeklyQuotaSync:        weeklyQuotaSyncHandler,
 		Group:                  groupHandler,
 		Account:                accountHandler,
 		Announcement:           announcementHandler,
@@ -229,6 +231,7 @@ var ProviderSet = wire.NewSet(
 	// Admin handlers
 	admin.NewDashboardHandler,
 	admin.NewUserHandler,
+	admin.NewUserWeeklyQuotaSyncHandler,
 	admin.NewGroupHandler,
 	admin.ProvideAccountHandler,
 	admin.NewAnnouncementHandler,

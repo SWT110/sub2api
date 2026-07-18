@@ -495,6 +495,54 @@ func (c *billingCache) DeleteUserPlatformQuotaCache(ctx context.Context, userID 
 	return c.rdb.Del(ctx, userPlatformQuotaCacheKey(userID, platform)).Err()
 }
 
+// resetUserPlatformQuotaWeeklyWindowScript updates only the weekly portion of
+// a cached quota entry when its window is not newer than the requested start.
+// It intentionally leaves a dirty member in place after an update: daily and
+// monthly increments can share that member and must still reach the DB. The
+// snapshot writer has a monotonic window-start guard, so a stale in-flight
+// flusher snapshot cannot overwrite this newer weekly window.
+// KEYS[1] = quota hash key
+// KEYS[2] = dirty set key
+// ARGV[1] = new weekly window start unix seconds
+// ARGV[2] = dirty member
+const resetUserPlatformQuotaWeeklyWindowScript = `
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    redis.call("SREM", KEYS[2], ARGV[2])
+    return 0
+end
+local current = redis.call("HGET", KEYS[1], "weekly_window_start")
+if current == false or current == "" or tonumber(current) == nil or tonumber(current) <= tonumber(ARGV[1]) then
+    redis.call("HSET", KEYS[1], "weekly_usage", "0", "weekly_window_start", ARGV[1])
+    redis.call("HINCRBY", KEYS[1], "version", 1)
+    return 1
+end
+return 0
+`
+
+// ResetUserPlatformQuotaWeeklyCache aligns affected OpenAI quota cache entries
+// with a freshly observed upstream seven-day window. It is safe to call with
+// the exact IDs returned by ResetWeeklyWindowForPlatform; newer manual windows
+// are preserved by the Lua comparison.
+func (c *billingCache) ResetUserPlatformQuotaWeeklyCache(ctx context.Context, userIDs []int64, platform string, newStart time.Time) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	startUnix := newStart.UTC().Truncate(time.Second).Unix()
+	pipe := c.rdb.Pipeline()
+	for _, userID := range userIDs {
+		pipe.Eval(ctx, resetUserPlatformQuotaWeeklyWindowScript,
+			[]string{userPlatformQuotaCacheKey(userID, platform), userPlatformQuotaDirtySetKey()},
+			startUnix,
+			userPlatformQuotaDirtyMember(userID, platform),
+		)
+	}
+	_, err := pipe.Exec(ctx)
+	if errors.Is(err, redis.Nil) {
+		return nil
+	}
+	return err
+}
+
 // updateUserPlatformQuotaUsageScript 缓存累加：EXISTS + schema_version 双重守卫。
 // 旧版 entry（schema_version != ARGV[3]，包括缺字段的 0 值）不参与累加，由上层走 DB fallback 后
 // SetCache 重建为新版 entry —— 若此处仍累加，上层覆盖时会丢失这部分增量，导致 Redis usage 比真实偏小。

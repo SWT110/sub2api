@@ -35,6 +35,12 @@ var ErrUserPlatformQuotaNotFound = fmt.Errorf("user platform quota record not fo
 // ErrUserPlatformQuotaFKViolation 当批量 UPSERT 中存在 user_id 不在 users 表的记录时返回。
 var ErrUserPlatformQuotaFKViolation = errors.New("user platform quota snapshot FK violation")
 
+// weeklyQuotaWindowDuration is deliberately a fixed 7x24h rolling window.
+// Unlike daily quotas, weekly user-platform quotas must not be tied to a
+// calendar week because the upstream Codex window resets at account-specific
+// times.
+const weeklyQuotaWindowDuration = 7 * 24 * time.Hour
+
 // UserPlatformQuotaSnapshot 是 BatchSnapshotUsage 的输入结构体，
 // 表示 Redis 当前窗口快照（用于绝对值覆盖写入 DB）。
 type UserPlatformQuotaSnapshot struct {
@@ -60,6 +66,10 @@ type UserPlatformQuotaRepository interface {
 	IncrementUsageWithReset(ctx context.Context, userID int64, platform string, cost float64, now time.Time) error
 	// ResetExpiredWindow 重置指定窗口（daily/weekly/monthly）的用量与起始时间。
 	ResetExpiredWindow(ctx context.Context, userID int64, platform string, window string, newStart time.Time) error
+	// ResetWeeklyWindowForPlatform atomically resets weekly usage for rows with
+	// a configured weekly limit whose window began before newStart. The returned
+	// IDs are the exact rows changed, so callers can keep Redis coherent.
+	ResetWeeklyWindowForPlatform(ctx context.Context, platform string, newStart time.Time) ([]int64, error)
 	// UpsertForUser 全量替换该用户所有平台限额配置（详见 service.UserPlatformQuotaRepository.UpsertForUser）。
 	UpsertForUser(ctx context.Context, userID int64, records []UserPlatformQuotaRecord) error
 	// BatchSnapshotUsage 用一条多行 UPSERT 把整批 usage 以绝对值覆盖写入(非累加)。
@@ -177,6 +187,7 @@ func (r *userPlatformQuotaRepository) ListByUser(ctx context.Context, userID int
 //
 // 上层正常路径（注册时 BulkInsertInitial）保证 limit 在记录创建时就被写入。
 func (r *userPlatformQuotaRepository) IncrementUsageWithReset(ctx context.Context, userID int64, platform string, cost float64, now time.Time) error {
+	now = now.UTC()
 	return r.withTx(ctx, func(txCtx context.Context, txClient *dbent.Client) error {
 		existing, err := txClient.UserPlatformQuota.Query().
 			Where(
@@ -201,10 +212,10 @@ func (r *userPlatformQuotaRepository) IncrementUsageWithReset(ctx context.Contex
 					weekly_usage_usd  = user_platform_quotas.weekly_usage_usd  + EXCLUDED.weekly_usage_usd,
 					monthly_usage_usd = user_platform_quotas.monthly_usage_usd + EXCLUDED.monthly_usage_usd,
 					updated_at        = EXCLUDED.updated_at`
-			// $6 = now：30 天滚动月度窗口以当前时刻为起始
+			// $5/$6 = now：周、月窗口均以首次实际使用时刻为起始。
 			_, e := txClient.ExecContext(txCtx, insertSQL,
 				userID, platform, cost,
-				timezone.StartOfDay(now), timezone.StartOfWeek(now), now, now)
+				timezone.StartOfDay(now), now, now, now)
 			return e
 		}
 		if err != nil {
@@ -212,7 +223,7 @@ func (r *userPlatformQuotaRepository) IncrementUsageWithReset(ctx context.Contex
 		}
 
 		newDaily := maybeReset(existing.DailyUsageUsd, existing.DailyWindowStart, timezone.StartOfDay(now), cost)
-		newWeekly := maybeReset(existing.WeeklyUsageUsd, existing.WeeklyWindowStart, timezone.StartOfWeek(now), cost)
+		newWeekly, newWeeklyStart := weeklyMaybeReset(existing.WeeklyUsageUsd, existing.WeeklyWindowStart, cost, now)
 		// 30 天滚动月度窗口：过期时重置为 cost 并以 now 为新起始，否则累加保留原起始
 		newMonthly, newMonthlyStart := monthlyMaybeReset(existing.MonthlyUsageUsd, existing.MonthlyWindowStart, cost, now)
 
@@ -221,7 +232,7 @@ func (r *userPlatformQuotaRepository) IncrementUsageWithReset(ctx context.Contex
 			SetWeeklyUsageUsd(newWeekly).
 			SetMonthlyUsageUsd(newMonthly).
 			SetDailyWindowStart(timezone.StartOfDay(now)).
-			SetWeeklyWindowStart(timezone.StartOfWeek(now)).
+			SetWeeklyWindowStart(newWeeklyStart).
 			SetMonthlyWindowStart(newMonthlyStart). // 30 天滚动：仅过期时更新起始
 			Save(txCtx)
 		return e
@@ -267,6 +278,46 @@ func (r *userPlatformQuotaRepository) ResetExpiredWindow(ctx context.Context, us
 		return ErrUserPlatformQuotaNotFound
 	}
 	return nil
+}
+
+// ResetWeeklyWindowForPlatform resets the weekly window for every active row
+// with a non-nil weekly limit. The strict older-than predicate is important:
+// repeated observations of the same upstream reset are idempotent and never
+// clear a user who was manually anchored after that upstream window began.
+func (r *userPlatformQuotaRepository) ResetWeeklyWindowForPlatform(ctx context.Context, platform string, newStart time.Time) ([]int64, error) {
+	client := clientFromContext(ctx, r.client)
+	newStart = newStart.UTC().Truncate(time.Second)
+	now := time.Now().UTC()
+	rows, err := client.QueryContext(ctx, `
+WITH reset_rows AS (
+    UPDATE user_platform_quotas
+       SET weekly_usage_usd = 0,
+           weekly_window_start = $1,
+           updated_at = $2
+     WHERE platform = $3
+       AND deleted_at IS NULL
+       AND weekly_limit_usd IS NOT NULL
+       AND (weekly_window_start IS NULL OR weekly_window_start < $1)
+ RETURNING user_id
+)
+SELECT user_id FROM reset_rows ORDER BY user_id`, newStart, now, platform)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	userIDs := make([]int64, 0)
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			return nil, err
+		}
+		userIDs = append(userIDs, userID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return userIDs, nil
 }
 
 // withTx 在事务中执行 fn，若 ctx 中已有事务则复用。
@@ -318,6 +369,16 @@ func maybeReset(prevUsage float64, prevStart *time.Time, currStart time.Time, co
 		return cost
 	}
 	return prevUsage + cost
+}
+
+// weeklyMaybeReset applies the rolling 7-day weekly window. Existing records
+// created before this behavior keep their current start as the initial anchor;
+// once it expires, the next actual usage starts a new rolling window.
+func weeklyMaybeReset(prevUsage float64, prevStart *time.Time, cost float64, now time.Time) (float64, time.Time) {
+	if prevStart == nil || !now.Before(prevStart.Add(weeklyQuotaWindowDuration)) {
+		return cost, now
+	}
+	return prevUsage + cost, *prevStart
 }
 
 // monthlyMaybeReset 判断 30 天滚动月度窗口是否需要重置。
@@ -440,7 +501,9 @@ func insertLimitsRow(ctx context.Context, client *dbent.Client, userID int64, re
 // batchRows 是 BatchSnapshotUsage 每批最大行数（9 参/行 × 6000 ≈ 54000 参,低于 Postgres 65535 上限）。
 const batchRows = 6000
 
-// BatchSnapshotUsage 用一条多行 UPSERT 把整批 usage 以绝对值覆盖写入（非累加）。
+// BatchSnapshotUsage writes Redis usage snapshots with a monotonic window-start
+// guard. A snapshot from an older window must never overwrite an admin or
+// upstream-triggered reset that has already established a newer window.
 // 每批最多 batchRows 行；$1=now 共用；每行 8 个 per-row 参（user_id, platform, 3×usage, 3×window_start）。
 // FK 违反（user_id 不存在）返回 ErrUserPlatformQuotaFKViolation。
 //
@@ -488,13 +551,13 @@ func (r *userPlatformQuotaRepository) BatchSnapshotUsage(ctx context.Context, sn
 
 		_, _ = sb.WriteString(
 			" ON CONFLICT (user_id, platform) WHERE deleted_at IS NULL DO UPDATE SET" +
-				"  daily_usage_usd      = EXCLUDED.daily_usage_usd," +
-				"  weekly_usage_usd     = EXCLUDED.weekly_usage_usd," +
-				"  monthly_usage_usd    = EXCLUDED.monthly_usage_usd," +
-				"  daily_window_start   = EXCLUDED.daily_window_start," +
-				"  weekly_window_start  = EXCLUDED.weekly_window_start," +
-				"  monthly_window_start = EXCLUDED.monthly_window_start," +
-				"  updated_at           = EXCLUDED.updated_at")
+				"  daily_usage_usd = CASE WHEN user_platform_quotas.daily_window_start IS NOT NULL AND user_platform_quotas.daily_window_start > EXCLUDED.daily_window_start THEN user_platform_quotas.daily_usage_usd ELSE EXCLUDED.daily_usage_usd END," +
+				"  weekly_usage_usd = CASE WHEN user_platform_quotas.weekly_window_start IS NOT NULL AND user_platform_quotas.weekly_window_start > EXCLUDED.weekly_window_start THEN user_platform_quotas.weekly_usage_usd ELSE EXCLUDED.weekly_usage_usd END," +
+				"  monthly_usage_usd = CASE WHEN user_platform_quotas.monthly_window_start IS NOT NULL AND user_platform_quotas.monthly_window_start > EXCLUDED.monthly_window_start THEN user_platform_quotas.monthly_usage_usd ELSE EXCLUDED.monthly_usage_usd END," +
+				"  daily_window_start = CASE WHEN user_platform_quotas.daily_window_start IS NOT NULL AND user_platform_quotas.daily_window_start > EXCLUDED.daily_window_start THEN user_platform_quotas.daily_window_start ELSE EXCLUDED.daily_window_start END," +
+				"  weekly_window_start = CASE WHEN user_platform_quotas.weekly_window_start IS NOT NULL AND user_platform_quotas.weekly_window_start > EXCLUDED.weekly_window_start THEN user_platform_quotas.weekly_window_start ELSE EXCLUDED.weekly_window_start END," +
+				"  monthly_window_start = CASE WHEN user_platform_quotas.monthly_window_start IS NOT NULL AND user_platform_quotas.monthly_window_start > EXCLUDED.monthly_window_start THEN user_platform_quotas.monthly_window_start ELSE EXCLUDED.monthly_window_start END," +
+				"  updated_at = EXCLUDED.updated_at")
 
 		if _, err := client.ExecContext(ctx, sb.String(), args...); err != nil {
 			var pqErr *pq.Error
