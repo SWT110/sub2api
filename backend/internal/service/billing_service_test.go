@@ -1205,6 +1205,7 @@ func TestCalculateCost_LargeTokenCount(t *testing.T) {
 func TestServiceTierCostMultiplier(t *testing.T) {
 	require.InDelta(t, 2.0, serviceTierCostMultiplier("priority"), 1e-12)
 	require.InDelta(t, 2.0, serviceTierCostMultiplier(" Priority "), 1e-12)
+	require.InDelta(t, 2.0, serviceTierCostMultiplier("fast"), 1e-12)
 	require.InDelta(t, 0.5, serviceTierCostMultiplier("flex"), 1e-12)
 	require.InDelta(t, 1.0, serviceTierCostMultiplier(""), 1e-12)
 	require.InDelta(t, 1.0, serviceTierCostMultiplier("default"), 1e-12)
@@ -1499,6 +1500,32 @@ func TestGetModelPricingWithChannel_OverrideAllFields(t *testing.T) {
 	require.InDelta(t, 1e-6, pricing.CacheReadPricePerToken, 1e-12)
 	require.InDelta(t, 1e-6, pricing.CacheReadPricePerTokenPriority, 1e-12)
 	require.InDelta(t, 50e-6, pricing.ImageOutputPricePerToken, 1e-12)
+}
+
+func TestGetModelPricingWithChannel_GPT56FastUsesTwoPointFiveMultiplier(t *testing.T) {
+	svc := newTestBillingService()
+
+	channelPricing := &ChannelModelPricing{
+		InputPrice:      testPtrFloat64(4e-6),
+		OutputPrice:     testPtrFloat64(20e-6),
+		CacheWritePrice: testPtrFloat64(5e-6),
+		CacheReadPrice:  testPtrFloat64(0.4e-6),
+	}
+	pricing, err := svc.GetModelPricingWithChannel("gpt-5.6-terra", channelPricing)
+	require.NoError(t, err)
+	require.InDelta(t, 4e-6, pricing.InputPricePerToken, 1e-12)
+	require.InDelta(t, 10e-6, pricing.InputPricePerTokenPriority, 1e-12)
+	require.InDelta(t, 20e-6, pricing.OutputPricePerToken, 1e-12)
+	require.InDelta(t, 50e-6, pricing.OutputPricePerTokenPriority, 1e-12)
+	require.InDelta(t, 5e-6, pricing.CacheCreationPricePerToken, 1e-12)
+	require.InDelta(t, 12.5e-6, pricing.CacheCreationPricePerTokenPriority, 1e-12)
+	require.InDelta(t, 0.4e-6, pricing.CacheReadPricePerToken, 1e-12)
+	require.InDelta(t, 1e-6, pricing.CacheReadPricePerTokenPriority, 1e-12)
+
+	tokens := UsageTokens{InputTokens: 100, OutputTokens: 50, CacheCreationTokens: 25, CacheReadTokens: 20}
+	standard := svc.computeTokenBreakdown(pricing, tokens, 1, "", false)
+	fast := svc.computeTokenBreakdown(pricing, tokens, 1, "fast", false)
+	require.InDelta(t, standard.TotalCost*2.5, fast.TotalCost, 1e-12)
 }
 
 func TestGetModelPricingWithChannel_CacheWritePriceAffects5mAnd1h(t *testing.T) {
