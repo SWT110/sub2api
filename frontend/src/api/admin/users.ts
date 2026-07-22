@@ -370,12 +370,17 @@ export interface UserWeeklyQuotaSyncState {
   source_account_id: number
   observed_reset_at?: string | null
   observed_window_seconds?: number | null
+  observed_weekly_used_percent?: number | null
+  peak_weekly_used_percent?: number | null
   observed_source?: string | null
+  pending_signal?: string | null
   pending_reset_at?: string | null
+  pending_window_start?: string | null
   last_checked_at?: string | null
   last_triggered_at?: string | null
   last_window_start?: string | null
   last_affected_users: number
+  last_trigger_signal?: string | null
   last_error?: string | null
 }
 
@@ -395,8 +400,9 @@ export interface UserWeeklyQuotaSyncCheckResult {
   baseline_initialized: boolean
   awaiting_confirmation: boolean
   reset_detected: boolean
-  reset_at: string
-  window_start: string
+  detection_signal?: string | null
+  reset_at?: string | null
+  window_start?: string | null
   affected_users: number
   status: UserWeeklyQuotaSyncStatus
 }

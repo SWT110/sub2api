@@ -83,12 +83,34 @@
               {{ displayTime(status?.state.observed_reset_at) }}
             </dd>
           </div>
-          <div v-if="status?.state.pending_reset_at">
+          <div>
+            <dt class="text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.users.weeklyQuotaSync.observedWeeklyUsedPercent') }}
+            </dt>
+            <dd class="mt-1 font-medium text-gray-900 dark:text-white">
+              {{ displayPercent(status?.state.observed_weekly_used_percent) }}
+            </dd>
+          </div>
+          <div>
+            <dt class="text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.users.weeklyQuotaSync.peakWeeklyUsedPercent') }}
+            </dt>
+            <dd class="mt-1 font-medium text-gray-900 dark:text-white">
+              {{ displayPercent(status?.state.peak_weekly_used_percent) }}
+            </dd>
+          </div>
+          <div v-if="status?.state.pending_signal || status?.state.pending_reset_at">
             <dt class="text-xs text-amber-600 dark:text-amber-400">
-              {{ t('admin.users.weeklyQuotaSync.pendingResetAt') }}
+              {{ t('admin.users.weeklyQuotaSync.pendingSignal') }}
             </dt>
             <dd class="mt-1 font-medium text-amber-700 dark:text-amber-300">
-              {{ displayTime(status.state.pending_reset_at) }}
+              {{ displaySignal(status?.state.pending_signal) }}
+              <span v-if="status?.state.pending_reset_at" class="ml-1">
+                {{ displayTime(status.state.pending_reset_at) }}
+              </span>
+              <span v-else-if="status?.state.pending_window_start" class="ml-1">
+                {{ displayTime(status.state.pending_window_start) }}
+              </span>
             </dd>
           </div>
           <div>
@@ -113,6 +135,14 @@
             </dt>
             <dd class="mt-1 font-medium text-gray-900 dark:text-white">
               {{ displayTime(status?.state.last_triggered_at) }}
+            </dd>
+          </div>
+          <div>
+            <dt class="text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.users.weeklyQuotaSync.lastTriggerSignal') }}
+            </dt>
+            <dd class="mt-1 font-medium text-gray-900 dark:text-white">
+              {{ status?.state.last_trigger_signal ? displaySignal(status.state.last_trigger_signal) : t('admin.users.weeklyQuotaSync.notAvailable') }}
             </dd>
           </div>
           <div>
@@ -251,6 +281,20 @@ function applyStatus(next: UserWeeklyQuotaSyncStatus) {
 
 function displayTime(value?: string | null): string {
   return formatDateTime(value) || t('admin.users.weeklyQuotaSync.notAvailable')
+}
+
+function displayPercent(value?: number | null): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return t('admin.users.weeklyQuotaSync.notAvailable')
+  }
+  return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`
+}
+
+function displaySignal(signal?: string | null): string {
+  if (signal === 'usage_percent_zero') {
+    return t('admin.users.weeklyQuotaSync.signalUsagePercent')
+  }
+  return t('admin.users.weeklyQuotaSync.signalResetTime')
 }
 
 function errorMessage(error: any, fallback: string): string {

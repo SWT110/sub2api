@@ -96,6 +96,22 @@ func weeklyUsage(resetAt time.Time) *OpenAIQuotaUsage {
 	}
 }
 
+func weeklyUsageWithPercent(usedPercent float64, resetAt *time.Time) *OpenAIQuotaUsage {
+	weekly := &OpenAIRateLimitWindow{
+		UsedPercent:        usedPercent,
+		LimitWindowSeconds: int64((7 * 24 * time.Hour).Seconds()),
+	}
+	if resetAt != nil {
+		weekly.ResetAt = resetAt.Unix()
+	}
+	return &OpenAIQuotaUsage{
+		RateLimit: &OpenAIRateLimit{
+			PrimaryWindow:   &OpenAIRateLimitWindow{LimitWindowSeconds: 5 * 60 * 60},
+			SecondaryWindow: weekly,
+		},
+	}
+}
+
 func TestFindOpenAIWeeklyQuotaWindowUsesPrimaryBeforeIndependentAdditionalLimit(t *testing.T) {
 	baseReset := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	additionalReset := baseReset.Add(time.Hour)
@@ -155,6 +171,19 @@ func TestFindOpenAIWeeklyQuotaSignalUsesCountdownWhenResetAtDisagrees(t *testing
 	require.NoError(t, err)
 	require.Equal(t, wantReset, signal.resetAt)
 	require.Equal(t, int64((7 * time.Hour * 24).Seconds()), signal.windowSeconds)
+}
+
+func TestFindOpenAIWeeklyQuotaObservationAllowsZeroUsageWithoutResetTime(t *testing.T) {
+	usage := weeklyUsageWithPercent(0, nil)
+
+	observation, err := findOpenAIWeeklyQuotaObservation(usage, time.Date(2026, 7, 22, 8, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Zero(t, observation.usedPercent)
+	require.Nil(t, observation.resetAt)
+	require.Equal(t, int64((7 * 24 * time.Hour).Seconds()), observation.windowSeconds)
+
+	_, err = findOpenAIWeeklyQuotaSignal(usage, time.Now())
+	require.ErrorIs(t, err, ErrUserWeeklyQuotaSyncNoWeeklyLimit)
 }
 
 func TestUserWeeklyQuotaSyncCheckBaselinesThenConfirmsAndResetsUsers(t *testing.T) {
@@ -385,6 +414,87 @@ func TestUserWeeklyQuotaSyncConfirmsBoundaryDespiteCountdownSecondDrift(t *testi
 	require.NoError(t, err)
 	require.True(t, triggered.ResetDetected)
 	require.Len(t, resetter.starts, 1)
+}
+
+func TestUserWeeklyQuotaSyncDetectsUsagePercentResetWithoutResetTimeOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	previousResetAt := now.Add(3 * 24 * time.Hour)
+	firstZeroSeenAt := previousResetAt.Add(time.Minute)
+	newResetAt := firstZeroSeenAt.Add(7 * 24 * time.Hour)
+	config := UserWeeklyQuotaSyncConfig{Enabled: true, SourceAccountID: 9, PollIntervalSeconds: 60}
+	configJSON, err := json.Marshal(config)
+	require.NoError(t, err)
+	settings := &weeklyQuotaSyncSettingRepo{values: map[string]string{
+		SettingKeyUserWeeklyQuotaSyncConfig: string(configJSON),
+	}}
+	accounts := &weeklyQuotaSyncAccountRepo{accounts: map[int64]*Account{
+		9: {ID: 9, Name: "Codex Pro", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive},
+	}}
+	resetter := &weeklyQuotaSyncResetter{ids: []int64{101, 102}}
+	service := &UserWeeklyQuotaSyncService{
+		settingRepo: settings,
+		accountRepo: accounts,
+		quotaService: &weeklyQuotaSyncUsageReader{responses: []*OpenAIQuotaUsage{
+			weeklyUsageWithPercent(18, &previousResetAt),
+			weeklyUsageWithPercent(0, nil),
+			weeklyUsageWithPercent(0, nil),
+			weeklyUsageWithPercent(3, &newResetAt),
+			weeklyUsageWithPercent(5, &newResetAt),
+		}},
+		bulkResetter: resetter,
+		instanceID:   "test-instance",
+		now:          func() time.Time { return now },
+	}
+
+	baseline, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, baseline.BaselineInitialized)
+	require.NotNil(t, baseline.Status.State.PeakWeeklyUsedPercent)
+	require.InDelta(t, 18, *baseline.Status.State.PeakWeeklyUsedPercent, 1e-9)
+
+	now = firstZeroSeenAt
+	pending, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, pending.AwaitingConfirmation)
+	require.Equal(t, userWeeklyQuotaSyncSignalUsagePercent, pending.DetectionSignal)
+	require.Equal(t, userWeeklyQuotaSyncSignalUsagePercent, pending.Status.State.PendingSignal)
+	require.Nil(t, pending.Status.State.PendingResetAt)
+	require.NotNil(t, pending.Status.State.PendingWindowStart)
+	require.Equal(t, firstZeroSeenAt, *pending.Status.State.PendingWindowStart)
+	require.Empty(t, resetter.starts)
+
+	now = now.Add(time.Minute)
+	triggered, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.True(t, triggered.ResetDetected)
+	require.Equal(t, userWeeklyQuotaSyncSignalUsagePercent, triggered.DetectionSignal)
+	require.Equal(t, []time.Time{firstZeroSeenAt}, resetter.starts)
+	require.Equal(t, userWeeklyQuotaSyncSignalUsagePercent, triggered.Status.State.LastTriggerSignal)
+	require.Nil(t, triggered.Status.State.ObservedResetAt)
+
+	// Codex now has 1-5% fresh-cycle usage and starts showing reset_at again.
+	// This must establish a new timestamp baseline, not clear every user a
+	// second time for the same upstream cycle.
+	now = now.Add(time.Minute)
+	afterUse, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.False(t, afterUse.ResetDetected)
+	require.False(t, afterUse.AwaitingConfirmation)
+	require.Len(t, resetter.starts, 1)
+	require.NotNil(t, afterUse.Status.State.ObservedResetAt)
+	require.Equal(t, newResetAt, *afterUse.Status.State.ObservedResetAt)
+	require.NotNil(t, afterUse.Status.State.PeakWeeklyUsedPercent)
+	require.InDelta(t, 3, *afterUse.Status.State.PeakWeeklyUsedPercent, 1e-9)
+
+	now = now.Add(time.Minute)
+	stable, err := service.CheckNow(ctx)
+	require.NoError(t, err)
+	require.False(t, stable.ResetDetected)
+	require.False(t, stable.AwaitingConfirmation)
+	require.Len(t, resetter.starts, 1)
+	require.NotNil(t, stable.Status.State.ObservedWeeklyUsedPercent)
+	require.InDelta(t, 5, *stable.Status.State.ObservedWeeklyUsedPercent, 1e-9)
 }
 
 func TestUserWeeklyQuotaSyncResetAllAtResetsOnlyAffectedUsers(t *testing.T) {
