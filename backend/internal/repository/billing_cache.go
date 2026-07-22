@@ -543,6 +543,57 @@ func (c *billingCache) ResetUserPlatformQuotaWeeklyCache(ctx context.Context, us
 	return err
 }
 
+// alignUserPlatformQuotaWeeklyWindowScript corrects the provisional weekly
+// anchor after Codex exposes the authoritative reset time. It changes only an
+// exact expected anchor, preserving any fresh-cycle usage and avoiding an
+// administrator's later per-user anchor change.
+// KEYS[1] = quota hash key
+// KEYS[2] = dirty set key
+// ARGV[1] = expected weekly window start unix seconds
+// ARGV[2] = authoritative weekly window start unix seconds
+// ARGV[3] = dirty member
+const alignUserPlatformQuotaWeeklyWindowScript = `
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    redis.call("SREM", KEYS[2], ARGV[3])
+    return 0
+end
+local current = redis.call("HGET", KEYS[1], "weekly_window_start")
+if current ~= false and tonumber(current) == tonumber(ARGV[1]) then
+    redis.call("HSET", KEYS[1], "weekly_window_start", ARGV[2])
+    redis.call("HINCRBY", KEYS[1], "version", 1)
+    return 1
+end
+return 0
+`
+
+// AlignUserPlatformQuotaWeeklyCache changes only cached weekly anchors for
+// rows whose DB anchor was updated by AlignWeeklyWindowStartForPlatform. It
+// leaves dirty membership intact so a pending usage snapshot is still flushed.
+func (c *billingCache) AlignUserPlatformQuotaWeeklyCache(ctx context.Context, userIDs []int64, platform string, expectedStart, newStart time.Time) error {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	expectedUnix := expectedStart.UTC().Truncate(time.Second).Unix()
+	newUnix := newStart.UTC().Truncate(time.Second).Unix()
+	if expectedUnix == newUnix {
+		return nil
+	}
+	pipe := c.rdb.Pipeline()
+	for _, userID := range userIDs {
+		pipe.Eval(ctx, alignUserPlatformQuotaWeeklyWindowScript,
+			[]string{userPlatformQuotaCacheKey(userID, platform), userPlatformQuotaDirtySetKey()},
+			expectedUnix,
+			newUnix,
+			userPlatformQuotaDirtyMember(userID, platform),
+		)
+	}
+	_, err := pipe.Exec(ctx)
+	if errors.Is(err, redis.Nil) {
+		return nil
+	}
+	return err
+}
+
 // updateUserPlatformQuotaUsageScript 缓存累加：EXISTS + schema_version 双重守卫。
 // 旧版 entry（schema_version != ARGV[3]，包括缺字段的 0 值）不参与累加，由上层走 DB fallback 后
 // SetCache 重建为新版 entry —— 若此处仍累加，上层覆盖时会丢失这部分增量，导致 Redis usage 比真实偏小。

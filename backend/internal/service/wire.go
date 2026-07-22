@@ -769,10 +769,12 @@ func ProvideUserWeeklyQuotaSyncService(
 	quotaService *OpenAIQuotaService,
 	quotaRepo UserPlatformQuotaRepository,
 	cache BillingCache,
+	rateLimitService *RateLimitService,
 	lockCache LeaderLockCache,
 	db *sql.DB,
 ) *UserWeeklyQuotaSyncService {
 	svc := NewUserWeeklyQuotaSyncService(settingRepo, accountRepo, quotaService, quotaRepo, cache)
+	svc.SetSourceAccountRateLimitClearer(rateLimitService)
 	svc.SetLeaderLock(lockCache, db)
 	svc.Start()
 	return svc

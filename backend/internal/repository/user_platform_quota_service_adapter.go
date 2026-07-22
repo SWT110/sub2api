@@ -112,6 +112,13 @@ func (a *userPlatformQuotaServiceAdapter) ResetWeeklyWindowForPlatform(ctx conte
 	return a.inner.ResetWeeklyWindowForPlatform(ctx, platform, newStart)
 }
 
+// AlignWeeklyWindowStartForPlatform is the companion to the bulk reset above.
+// It is intentionally an optional service capability: only the production
+// adapter exposes it, so narrow request-path fakes remain unchanged.
+func (a *userPlatformQuotaServiceAdapter) AlignWeeklyWindowStartForPlatform(ctx context.Context, platform string, expectedStart, newStart time.Time) ([]int64, error) {
+	return a.inner.AlignWeeklyWindowStartForPlatform(ctx, platform, expectedStart, newStart)
+}
+
 // BatchSnapshotUsage 转换 []service.UserPlatformQuotaSnapshot → []UserPlatformQuotaSnapshot，
 // 调底层 repo，并将 repository FK sentinel 包装为 service sentinel。
 func (a *userPlatformQuotaServiceAdapter) BatchSnapshotUsage(ctx context.Context, snapshots []service.UserPlatformQuotaSnapshot, now time.Time) error {

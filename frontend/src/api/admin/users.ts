@@ -381,6 +381,8 @@ export interface UserWeeklyQuotaSyncState {
   last_window_start?: string | null
   last_affected_users: number
   last_trigger_signal?: string | null
+  pending_source_account_recovery?: boolean
+  last_source_account_recovered_at?: string | null
   last_error?: string | null
 }
 
@@ -400,6 +402,8 @@ export interface UserWeeklyQuotaSyncCheckResult {
   baseline_initialized: boolean
   awaiting_confirmation: boolean
   reset_detected: boolean
+  window_start_aligned: boolean
+  source_account_recovered: boolean
   detection_signal?: string | null
   reset_at?: string | null
   window_start?: string | null

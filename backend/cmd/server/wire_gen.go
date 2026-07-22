@@ -181,7 +181,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	adminService := service.NewAdminService(userRepository, adminGroupRepository, adminAccountRepository, proxyRepository, apiKeyRepository, redeemCodeRepository, userGroupRateRepository, userRPMCache, billingCacheService, proxyExitInfoProber, proxyLatencyCache, apiKeyAuthCacheInvalidator, client, settingService, subscriptionService, userSubscriptionRepository, privacyClientFactory, openAIGatewayService, affiliateService)
 	adminUserHandler := admin.NewUserHandler(adminService, concurrencyService, serviceUserPlatformQuotaRepository, billingCache, totpService, userService, settingService)
 	openAIQuotaService := service.ProvideOpenAIQuotaService(accountRepository, proxyRepository, openAITokenProvider, privacyClientFactory, openAIGatewayService)
-	userWeeklyQuotaSyncService := service.ProvideUserWeeklyQuotaSyncService(settingRepository, accountRepository, openAIQuotaService, serviceUserPlatformQuotaRepository, billingCache, leaderLockCache, db)
+	userWeeklyQuotaSyncService := service.ProvideUserWeeklyQuotaSyncService(settingRepository, accountRepository, openAIQuotaService, serviceUserPlatformQuotaRepository, billingCache, rateLimitService, leaderLockCache, db)
 	userWeeklyQuotaSyncHandler := admin.NewUserWeeklyQuotaSyncHandler(userWeeklyQuotaSyncService)
 	groupCapacityService := service.NewGroupCapacityService(accountRepository, groupRepository, concurrencyService, sessionLimitCache, rpmCache)
 	groupHandler := admin.NewGroupHandler(adminService, dashboardService, groupCapacityService)

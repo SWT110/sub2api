@@ -349,6 +349,50 @@ SELECT user_id FROM reset_rows ORDER BY user_id`, newStart, now, platform)
 	return userIDs, nil
 }
 
+// AlignWeeklyWindowStartForPlatform corrects the provisional anchor written by
+// the Codex percentage reset detector after /wham/usage later exposes the
+// authoritative reset time. Matching expectedStart scopes the update to this
+// exact sync event: a user whose administrator has since chosen a different
+// weekly start is deliberately left untouched. Weekly usage is never changed.
+func (r *userPlatformQuotaRepository) AlignWeeklyWindowStartForPlatform(ctx context.Context, platform string, expectedStart, newStart time.Time) ([]int64, error) {
+	client := clientFromContext(ctx, r.client)
+	expectedStart = expectedStart.UTC().Truncate(time.Second)
+	newStart = newStart.UTC().Truncate(time.Second)
+	if expectedStart.Equal(newStart) {
+		return nil, nil
+	}
+	now := time.Now().UTC()
+	rows, err := client.QueryContext(ctx, `
+WITH aligned_rows AS (
+    UPDATE user_platform_quotas
+       SET weekly_window_start = $1,
+           updated_at = $2
+     WHERE platform = $3
+       AND deleted_at IS NULL
+       AND weekly_limit_usd IS NOT NULL
+       AND weekly_window_start = $4
+ RETURNING user_id
+)
+SELECT user_id FROM aligned_rows ORDER BY user_id`, newStart, now, platform, expectedStart)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	userIDs := make([]int64, 0)
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			return nil, err
+		}
+		userIDs = append(userIDs, userID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return userIDs, nil
+}
+
 // withTx 在事务中执行 fn，若 ctx 中已有事务则复用。
 func (r *userPlatformQuotaRepository) withTx(ctx context.Context, fn func(txCtx context.Context, txClient *dbent.Client) error) error {
 	if tx := dbent.TxFromContext(ctx); tx != nil {

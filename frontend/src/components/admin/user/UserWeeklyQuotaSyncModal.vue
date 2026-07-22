@@ -145,6 +145,22 @@
               {{ status?.state.last_trigger_signal ? displaySignal(status.state.last_trigger_signal) : t('admin.users.weeklyQuotaSync.notAvailable') }}
             </dd>
           </div>
+          <div v-if="status?.state.pending_source_account_recovery">
+            <dt class="text-xs text-amber-600 dark:text-amber-400">
+              {{ t('admin.users.weeklyQuotaSync.pendingSourceAccountRecovery') }}
+            </dt>
+            <dd class="mt-1 font-medium text-amber-700 dark:text-amber-300">
+              {{ t('admin.users.weeklyQuotaSync.pendingSourceAccountRecoveryHint') }}
+            </dd>
+          </div>
+          <div>
+            <dt class="text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.users.weeklyQuotaSync.lastSourceAccountRecoveredAt') }}
+            </dt>
+            <dd class="mt-1 font-medium text-gray-900 dark:text-white">
+              {{ displayTime(status?.state.last_source_account_recovered_at) }}
+            </dd>
+          </div>
           <div>
             <dt class="text-xs text-gray-500 dark:text-gray-400">
               {{ t('admin.users.weeklyQuotaSync.lastAffectedUsers') }}
@@ -291,8 +307,11 @@ function displayPercent(value?: number | null): string {
 }
 
 function displaySignal(signal?: string | null): string {
-  if (signal === 'usage_percent_zero') {
-    return t('admin.users.weeklyQuotaSync.signalUsagePercent')
+  if (signal === 'usage_percent_drop' || signal === 'usage_percent_zero') {
+    return t('admin.users.weeklyQuotaSync.signalUsagePercentDrop')
+  }
+  if (signal === 'window_start_calibration') {
+    return t('admin.users.weeklyQuotaSync.signalWindowStartCalibration')
   }
   return t('admin.users.weeklyQuotaSync.signalResetTime')
 }
@@ -369,7 +388,15 @@ async function handleCheck() {
     const result = await adminAPI.users.checkUserWeeklyQuotaSyncNow()
     applyStatus(result.status)
     if (result.reset_detected) {
-      appStore.showSuccess(t('admin.users.weeklyQuotaSync.checkReset', { count: result.affected_users }))
+      appStore.showSuccess(
+        result.source_account_recovered
+          ? t('admin.users.weeklyQuotaSync.checkResetAndRecovered', { count: result.affected_users })
+          : t('admin.users.weeklyQuotaSync.checkReset', { count: result.affected_users })
+      )
+    } else if (result.source_account_recovered) {
+      appStore.showSuccess(t('admin.users.weeklyQuotaSync.checkSourceAccountRecovered'))
+    } else if (result.window_start_aligned) {
+      appStore.showSuccess(t('admin.users.weeklyQuotaSync.checkWindowStartAligned', { count: result.affected_users }))
     } else if (result.baseline_initialized) {
       appStore.showSuccess(t('admin.users.weeklyQuotaSync.checkBaseline'))
     } else if (result.awaiting_confirmation) {

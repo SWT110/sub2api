@@ -24,12 +24,18 @@ const (
 	userWeeklyQuotaSyncLeaderLockTTL       = 2 * time.Minute
 	userWeeklyQuotaSyncTargetWindow        = 7 * 24 * time.Hour
 	userWeeklyQuotaSyncWindowTolerance     = 24 * time.Hour
-	// The percentage detector is a fallback for the period immediately after a
-	// Codex reset, when /wham/usage may deliberately omit reset_at and
-	// reset_after_seconds. Requiring a meaningful prior peak avoids treating a
-	// rounding correction near zero as a reset for every user.
-	userWeeklyQuotaSyncUsageResetMinimumPercent = 1.0
-	userWeeklyQuotaSyncUsageZeroPercent         = 0.01
+	// Codex may omit reset_at/reset_after_seconds immediately after an official
+	// reset. The usage percentage is therefore the authoritative reset signal:
+	// a meaningful fall into the new-cycle range resets user quotas immediately.
+	// reset_at is deliberately handled separately as an anchor-calibration
+	// signal and never clears user usage by itself.
+	userWeeklyQuotaSyncUsageDropPercent = 5.0
+	userWeeklyQuotaSyncUsageLowPercent  = 10.0
+	// An exhausted Codex account can remain locally blocked after upstream has
+	// reset it. Only the unmistakable 100% -> 0-5% transition clears that
+	// account-level block automatically.
+	userWeeklyQuotaSyncUsageExhaustedPercent = 99.99
+	userWeeklyQuotaSyncRecoveryUsagePercent  = 5.0
 	// The upstream countdown is rounded while a request is in flight. Treat
 	// small differences as the same boundary so ordinary second-level drift is
 	// never mistaken for an early official reset.
@@ -38,10 +44,10 @@ const (
 	// disagrees materially with reset_at, use the countdown so synchronization
 	// follows the same real Codex window shown to the admin.
 	userWeeklyQuotaSyncResetAtTolerance  = 2 * time.Minute
-	userWeeklyQuotaSyncObservationSource = "codex_7d_usage_and_reset_v2"
+	userWeeklyQuotaSyncObservationSource = "codex_7d_usage_and_reset_v3"
 
-	userWeeklyQuotaSyncSignalResetTime    = "reset_time"
-	userWeeklyQuotaSyncSignalUsagePercent = "usage_percent_zero"
+	userWeeklyQuotaSyncSignalUsagePercentDrop       = "usage_percent_drop"
+	userWeeklyQuotaSyncSignalWindowStartCalibration = "window_start_calibration"
 )
 
 var (
@@ -78,18 +84,18 @@ type UserWeeklyQuotaSyncState struct {
 	// Unlike reset_at, it remains meaningful while a just-reset account has no
 	// next-reset timestamp yet.
 	ObservedWeeklyUsedPercent *float64 `json:"observed_weekly_used_percent,omitempty"`
-	// PeakWeeklyUsedPercent is reset after a confirmed upstream reset. It lets
-	// the percentage detector require a real, non-zero usage baseline before a
-	// later 0% observation can affect every user's quota.
+	// PeakWeeklyUsedPercent is reset after each detected upstream reset. It is
+	// the previous-cycle high watermark used to identify a sudden fall into a
+	// fresh Codex window.
 	PeakWeeklyUsedPercent *float64 `json:"peak_weekly_used_percent,omitempty"`
 	// ObservedSource identifies the upstream signal used for the persisted
 	// baseline. Changing it deliberately starts a new baseline rather than
 	// treating a different quota window as a user-quota reset.
 	ObservedSource string `json:"observed_source,omitempty"`
-	// PendingSignal and its fields persist a candidate reset until a second
-	// observation confirms it. For a percentage signal PendingResetAt is empty,
-	// because Codex has not supplied a next-reset timestamp yet; the first 0%
-	// observation time is retained as the user-quota window anchor instead.
+	// PendingSignal is used only after a percentage-triggered reset when Codex
+	// has not supplied a trustworthy next-reset timestamp yet. PendingWindowStart
+	// is the provisional anchor; a later reset_at can adjust that anchor without
+	// clearing any new-cycle user usage.
 	PendingSignal      string     `json:"pending_signal,omitempty"`
 	PendingResetAt     *time.Time `json:"pending_reset_at,omitempty"`
 	PendingWindowStart *time.Time `json:"pending_window_start,omitempty"`
@@ -98,7 +104,14 @@ type UserWeeklyQuotaSyncState struct {
 	LastWindowStart    *time.Time `json:"last_window_start,omitempty"`
 	LastAffectedUsers  int        `json:"last_affected_users"`
 	LastTriggerSignal  string     `json:"last_trigger_signal,omitempty"`
-	LastError          string     `json:"last_error,omitempty"`
+	// PendingSourceAccountRecovery is set only when the strongly identified
+	// 100% -> 0-5% reset could not clear local account scheduling state. It is
+	// retried independently so user quotas are never reset a second time.
+	PendingSourceAccountRecovery bool `json:"pending_source_account_recovery,omitempty"`
+	// LastSourceAccountRecoveredAt records automatic recovery of a source
+	// account that was locally left rate-limited after a 100% Codex window.
+	LastSourceAccountRecoveredAt *time.Time `json:"last_source_account_recovered_at,omitempty"`
+	LastError                    string     `json:"last_error,omitempty"`
 }
 
 // UserWeeklyQuotaSyncStatus is returned to the admin UI.
@@ -117,14 +130,16 @@ type UserWeeklyQuotaSyncAccount struct {
 
 // UserWeeklyQuotaSyncCheckResult describes one manual or scheduled check.
 type UserWeeklyQuotaSyncCheckResult struct {
-	BaselineInitialized  bool                      `json:"baseline_initialized"`
-	AwaitingConfirmation bool                      `json:"awaiting_confirmation"`
-	ResetDetected        bool                      `json:"reset_detected"`
-	DetectionSignal      string                    `json:"detection_signal,omitempty"`
-	ResetAt              *time.Time                `json:"reset_at,omitempty"`
-	WindowStart          *time.Time                `json:"window_start,omitempty"`
-	AffectedUsers        int                       `json:"affected_users"`
-	Status               UserWeeklyQuotaSyncStatus `json:"status"`
+	BaselineInitialized    bool                      `json:"baseline_initialized"`
+	AwaitingConfirmation   bool                      `json:"awaiting_confirmation"`
+	ResetDetected          bool                      `json:"reset_detected"`
+	WindowStartAligned     bool                      `json:"window_start_aligned"`
+	SourceAccountRecovered bool                      `json:"source_account_recovered"`
+	DetectionSignal        string                    `json:"detection_signal,omitempty"`
+	ResetAt                *time.Time                `json:"reset_at,omitempty"`
+	WindowStart            *time.Time                `json:"window_start,omitempty"`
+	AffectedUsers          int                       `json:"affected_users"`
+	Status                 UserWeeklyQuotaSyncStatus `json:"status"`
 }
 
 // userWeeklyQuotaBulkResetter is intentionally an optional extension of the
@@ -132,6 +147,21 @@ type UserWeeklyQuotaSyncCheckResult struct {
 // interface; production's repository adapter implements this capability.
 type userWeeklyQuotaBulkResetter interface {
 	ResetWeeklyWindowForPlatform(ctx context.Context, platform string, newStart time.Time) ([]int64, error)
+}
+
+// userWeeklyQuotaBulkWindowAligner changes only the window anchor for rows
+// reset by the current upstream event. expectedStart scopes the operation to
+// the provisional anchor so a later per-user manual anchor is never replaced.
+type userWeeklyQuotaBulkWindowAligner interface {
+	AlignWeeklyWindowStartForPlatform(ctx context.Context, platform string, expectedStart, newStart time.Time) ([]int64, error)
+}
+
+// sourceAccountRateLimitClearer uses the same narrow recovery path as the
+// administrator's clear-limit action. Besides persisted rate-limit fields it
+// clears temporary scheduler state, associated caches, and runtime blocks.
+// It deliberately does not clear a general account error status.
+type sourceAccountRateLimitClearer interface {
+	ClearRateLimit(ctx context.Context, accountID int64) error
 }
 
 // UserWeeklyQuotaSyncService monitors one OpenAI OAuth/Codex account's actual
@@ -142,12 +172,15 @@ type UserWeeklyQuotaSyncService struct {
 	quotaService interface {
 		QueryUsage(context.Context, int64) (*OpenAIQuotaUsage, error)
 	}
-	bulkResetter  userWeeklyQuotaBulkResetter
-	cacheResetter UserPlatformQuotaWeeklyCacheResetter
-	lockCache     LeaderLockCache
-	db            *sql.DB
-	instanceID    string
-	now           func() time.Time
+	bulkResetter     userWeeklyQuotaBulkResetter
+	windowAligner    userWeeklyQuotaBulkWindowAligner
+	cacheResetter    UserPlatformQuotaWeeklyCacheResetter
+	cacheAligner     UserPlatformQuotaWeeklyCacheAligner
+	rateLimitClearer sourceAccountRateLimitClearer
+	lockCache        LeaderLockCache
+	db               *sql.DB
+	instanceID       string
+	now              func() time.Time
 
 	parentCtx    context.Context
 	parentCancel context.CancelFunc
@@ -178,8 +211,14 @@ func NewUserWeeklyQuotaSyncService(
 	if resetter, ok := quotaRepo.(userWeeklyQuotaBulkResetter); ok {
 		s.bulkResetter = resetter
 	}
+	if aligner, ok := quotaRepo.(userWeeklyQuotaBulkWindowAligner); ok {
+		s.windowAligner = aligner
+	}
 	if resetter, ok := cache.(UserPlatformQuotaWeeklyCacheResetter); ok {
 		s.cacheResetter = resetter
+	}
+	if aligner, ok := cache.(UserPlatformQuotaWeeklyCacheAligner); ok {
+		s.cacheAligner = aligner
 	}
 	return s
 }
@@ -190,6 +229,15 @@ func (s *UserWeeklyQuotaSyncService) SetLeaderLock(lockCache LeaderLockCache, db
 	}
 	s.lockCache = lockCache
 	s.db = db
+}
+
+// SetSourceAccountRateLimitClearer wires the existing account-limit recovery
+// service without forcing focused unit-test fakes to implement it.
+func (s *UserWeeklyQuotaSyncService) SetSourceAccountRateLimitClearer(clearer sourceAccountRateLimitClearer) {
+	if s == nil {
+		return
+	}
+	s.rateLimitClearer = clearer
 }
 
 func defaultUserWeeklyQuotaSyncConfig() UserWeeklyQuotaSyncConfig {
@@ -359,14 +407,19 @@ func isUserWeeklyQuotaSyncSource(account *Account) bool {
 }
 
 func (s *UserWeeklyQuotaSyncService) validateSourceAccount(ctx context.Context, accountID int64) error {
+	_, err := s.getSourceAccount(ctx, accountID)
+	return err
+}
+
+func (s *UserWeeklyQuotaSyncService) getSourceAccount(ctx context.Context, accountID int64) (*Account, error) {
 	if s == nil || s.accountRepo == nil {
-		return ErrUserWeeklyQuotaSyncUnavailable
+		return nil, ErrUserWeeklyQuotaSyncUnavailable
 	}
 	account, err := s.accountRepo.GetByID(ctx, accountID)
 	if err != nil || !isUserWeeklyQuotaSyncSource(account) {
-		return ErrUserWeeklyQuotaSyncSourceInvalid
+		return nil, ErrUserWeeklyQuotaSyncSourceInvalid
 	}
-	return nil
+	return account, nil
 }
 
 func (s *UserWeeklyQuotaSyncService) Start() {
@@ -493,7 +546,8 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 	state.SourceAccountID = cfg.SourceAccountID
 	state.LastCheckedAt = &now
 
-	if err := s.validateSourceAccount(ctx, cfg.SourceAccountID); err != nil {
+	sourceAccount, err := s.getSourceAccount(ctx, cfg.SourceAccountID)
+	if err != nil {
 		state.LastError = err.Error()
 		_ = s.saveState(ctx, state)
 		return nil, err
@@ -538,24 +592,19 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 	candidate := findWeeklyQuotaSyncResetCandidate(state, observation, now)
 	if candidate != nil {
 		result.DetectionSignal = candidate.signal
-		result.ResetAt = weeklyQuotaSyncTimePtrFromPtr(candidate.resetAt)
 		result.WindowStart = weeklyQuotaSyncTimePtr(candidate.windowStart)
 
-		// A reset is destructive for every configured user. Both detectors need
-		// two consecutive observations: an advancing upstream boundary, or a
-		// meaningful prior usage percentage followed by 0% twice.
-		if !weeklyQuotaSyncPendingCandidateConfirmed(state, candidate) {
-			setWeeklyQuotaSyncPendingCandidate(state, candidate)
-			state.LastError = ""
-			if err := s.saveState(ctx, state); err != nil {
-				return nil, err
-			}
-			result.AwaitingConfirmation = true
-			result.Status = UserWeeklyQuotaSyncStatus{Config: *cfg, State: *state}
-			return result, nil
+		// Use an upstream timestamp immediately when it is demonstrably from the
+		// new cycle. Otherwise reset now and retain a provisional anchor for a
+		// later time-only calibration.
+		windowStart := candidate.windowStart
+		officialAnchor := false
+		if start, ok := weeklyQuotaSyncOfficialWindowStartForNewReset(state, observation, now); ok {
+			windowStart = start
+			officialAnchor = true
+			result.WindowStart = weeklyQuotaSyncTimePtr(windowStart)
 		}
 
-		windowStart := weeklyQuotaSyncPendingWindowStart(state, candidate)
 		affected, resetErr := s.resetUsersAt(ctx, windowStart)
 		if resetErr != nil {
 			state.LastError = resetErr.Error()
@@ -566,11 +615,23 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 		state.LastWindowStart = &windowStart
 		state.LastAffectedUsers = affected
 		state.LastTriggerSignal = candidate.signal
-		setWeeklyQuotaSyncConfirmedObservation(state, observation, candidate)
+		setWeeklyQuotaSyncAfterPercentageReset(state, observation, windowStart, officialAnchor)
+		recovered, recoveryErr := s.recoverSourceAccountAfterWeeklyReset(ctx, sourceAccount, candidate, observation)
+		if recovered {
+			state.PendingSourceAccountRecovery = false
+			state.LastSourceAccountRecoveredAt = weeklyQuotaSyncTimePtr(now)
+			result.SourceAccountRecovered = true
+		} else if recoveryErr != nil {
+			state.PendingSourceAccountRecovery = true
+		}
 		result.ResetDetected = true
 		result.AffectedUsers = affected
 		result.WindowStart = weeklyQuotaSyncTimePtr(windowStart)
-		state.LastError = ""
+		if recoveryErr != nil {
+			state.LastError = fmt.Sprintf("recover source account after weekly reset: %v", recoveryErr)
+		} else {
+			state.LastError = ""
+		}
 		if err := s.saveState(ctx, state); err != nil {
 			return nil, err
 		}
@@ -578,7 +639,39 @@ func (s *UserWeeklyQuotaSyncService) runCheck(ctx context.Context, cfg *UserWeek
 		return result, nil
 	}
 
-	clearWeeklyQuotaSyncPendingCandidate(state)
+	if state.PendingSignal == userWeeklyQuotaSyncSignalWindowStartCalibration && state.PendingWindowStart != nil {
+		if officialStart, ok := weeklyQuotaSyncOfficialWindowStartForCalibration(state, observation, now); ok {
+			affected, alignErr := s.alignUsersAt(ctx, *state.PendingWindowStart, officialStart)
+			if alignErr != nil {
+				state.LastError = alignErr.Error()
+				_ = s.saveState(ctx, state)
+				return nil, alignErr
+			}
+			state.LastWindowStart = weeklyQuotaSyncTimePtr(officialStart)
+			state.ObservedResetAt = weeklyQuotaSyncTimePtrFromPtr(observation.resetAt)
+			clearWeeklyQuotaSyncPendingCandidate(state)
+			result.WindowStartAligned = true
+			result.AffectedUsers = affected
+			result.WindowStart = weeklyQuotaSyncTimePtr(officialStart)
+		}
+	}
+	if state.PendingSourceAccountRecovery {
+		recovered, recoveryErr := s.clearSourceAccountRateLimit(ctx, sourceAccount.ID)
+		if recoveryErr != nil {
+			state.LastError = fmt.Sprintf("retry source account recovery: %v", recoveryErr)
+			if err := s.saveState(ctx, state); err != nil {
+				return nil, err
+			}
+			result.Status = UserWeeklyQuotaSyncStatus{Config: *cfg, State: *state}
+			return result, nil
+		}
+		if recovered {
+			state.PendingSourceAccountRecovery = false
+			state.LastSourceAccountRecoveredAt = weeklyQuotaSyncTimePtr(now)
+			result.SourceAccountRecovered = true
+		}
+	}
+
 	refreshWeeklyQuotaSyncObservation(state, observation)
 	state.LastError = ""
 	if err := s.saveState(ctx, state); err != nil {
@@ -601,6 +694,50 @@ func (s *UserWeeklyQuotaSyncService) resetUsersAt(ctx context.Context, start tim
 	return len(userIDs), nil
 }
 
+// alignUsersAt adjusts only the anchor that was written by the current
+// percentage-reset event. It intentionally preserves weekly usage accumulated
+// between the reset observation and the later authoritative upstream time.
+func (s *UserWeeklyQuotaSyncService) alignUsersAt(ctx context.Context, expectedStart, newStart time.Time) (int, error) {
+	if s == nil || s.windowAligner == nil {
+		return 0, ErrUserWeeklyQuotaSyncUnavailable
+	}
+	expectedStart = expectedStart.UTC().Truncate(time.Second)
+	newStart = newStart.UTC().Truncate(time.Second)
+	if expectedStart.Equal(newStart) {
+		return 0, nil
+	}
+	userIDs, err := s.windowAligner.AlignWeeklyWindowStartForPlatform(ctx, PlatformOpenAI, expectedStart, newStart)
+	if err != nil {
+		return 0, err
+	}
+	if s.cacheAligner != nil {
+		if err := s.cacheAligner.AlignUserPlatformQuotaWeeklyCache(ctx, userIDs, PlatformOpenAI, expectedStart, newStart); err != nil {
+			slog.Error("user_weekly_quota_sync_cache_align_failed", "affected_users", len(userIDs), "error", err)
+		}
+	}
+	return len(userIDs), nil
+}
+
+func (s *UserWeeklyQuotaSyncService) recoverSourceAccountAfterWeeklyReset(ctx context.Context, account *Account, candidate *weeklyQuotaSyncResetCandidate, observation *openAIWeeklyQuotaObservation) (bool, error) {
+	if s == nil || account == nil || candidate == nil || observation == nil {
+		return false, nil
+	}
+	if candidate.previousPeakPercent < userWeeklyQuotaSyncUsageExhaustedPercent || observation.usedPercent > userWeeklyQuotaSyncRecoveryUsagePercent {
+		return false, nil
+	}
+	return s.clearSourceAccountRateLimit(ctx, account.ID)
+}
+
+func (s *UserWeeklyQuotaSyncService) clearSourceAccountRateLimit(ctx context.Context, accountID int64) (bool, error) {
+	if s == nil || s.rateLimitClearer == nil || accountID <= 0 {
+		return false, nil
+	}
+	if err := s.rateLimitClearer.ClearRateLimit(ctx, accountID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *UserWeeklyQuotaSyncService) currentTime() time.Time {
 	if s != nil && s.now != nil {
 		return s.now()
@@ -621,51 +758,25 @@ func sameUpstreamWeeklyBoundary(left, right time.Time) bool {
 }
 
 type weeklyQuotaSyncResetCandidate struct {
-	signal      string
-	resetAt     *time.Time
-	windowStart time.Time
+	signal              string
+	windowStart         time.Time
+	previousPeakPercent float64
 }
 
 func findWeeklyQuotaSyncResetCandidate(state *UserWeeklyQuotaSyncState, observation *openAIWeeklyQuotaObservation, now time.Time) *weeklyQuotaSyncResetCandidate {
-	if state == nil || observation == nil {
+	if state == nil || observation == nil || state.PeakWeeklyUsedPercent == nil {
 		return nil
 	}
-	if observation.resetAt != nil && state.ObservedResetAt != nil && upstreamWeeklyWindowAdvanced(*state.ObservedResetAt, *observation.resetAt) {
-		start := observation.resetAt.Add(-time.Duration(observation.windowSeconds) * time.Second).Truncate(time.Second)
+	previousPeak := *state.PeakWeeklyUsedPercent
+	if previousPeak-observation.usedPercent > userWeeklyQuotaSyncUsageDropPercent &&
+		observation.usedPercent <= userWeeklyQuotaSyncUsageLowPercent {
 		return &weeklyQuotaSyncResetCandidate{
-			signal:      userWeeklyQuotaSyncSignalResetTime,
-			resetAt:     weeklyQuotaSyncTimePtr(*observation.resetAt),
-			windowStart: start,
-		}
-	}
-	if state.PeakWeeklyUsedPercent != nil &&
-		*state.PeakWeeklyUsedPercent >= userWeeklyQuotaSyncUsageResetMinimumPercent &&
-		observation.usedPercent <= userWeeklyQuotaSyncUsageZeroPercent {
-		return &weeklyQuotaSyncResetCandidate{
-			signal:      userWeeklyQuotaSyncSignalUsagePercent,
-			windowStart: now.UTC().Truncate(time.Second),
+			signal:              userWeeklyQuotaSyncSignalUsagePercentDrop,
+			windowStart:         now.UTC().Truncate(time.Second),
+			previousPeakPercent: previousPeak,
 		}
 	}
 	return nil
-}
-
-func weeklyQuotaSyncPendingCandidateConfirmed(state *UserWeeklyQuotaSyncState, candidate *weeklyQuotaSyncResetCandidate) bool {
-	if state == nil || candidate == nil || state.PendingSignal != candidate.signal || state.PendingWindowStart == nil {
-		return false
-	}
-	if candidate.signal != userWeeklyQuotaSyncSignalResetTime {
-		return candidate.signal == userWeeklyQuotaSyncSignalUsagePercent
-	}
-	return state.PendingResetAt != nil && candidate.resetAt != nil && sameUpstreamWeeklyBoundary(*state.PendingResetAt, *candidate.resetAt)
-}
-
-func setWeeklyQuotaSyncPendingCandidate(state *UserWeeklyQuotaSyncState, candidate *weeklyQuotaSyncResetCandidate) {
-	if state == nil || candidate == nil {
-		return
-	}
-	state.PendingSignal = candidate.signal
-	state.PendingResetAt = weeklyQuotaSyncTimePtrFromPtr(candidate.resetAt)
-	state.PendingWindowStart = weeklyQuotaSyncTimePtr(candidate.windowStart)
 }
 
 func clearWeeklyQuotaSyncPendingCandidate(state *UserWeeklyQuotaSyncState) {
@@ -677,14 +788,46 @@ func clearWeeklyQuotaSyncPendingCandidate(state *UserWeeklyQuotaSyncState) {
 	state.PendingWindowStart = nil
 }
 
-func weeklyQuotaSyncPendingWindowStart(state *UserWeeklyQuotaSyncState, candidate *weeklyQuotaSyncResetCandidate) time.Time {
-	if state != nil && state.PendingWindowStart != nil {
-		return state.PendingWindowStart.UTC().Truncate(time.Second)
+func weeklyQuotaSyncOfficialWindowStart(observation *openAIWeeklyQuotaObservation, now time.Time) (time.Time, bool) {
+	if observation == nil || observation.resetAt == nil || observation.windowSeconds <= 0 {
+		return time.Time{}, false
 	}
-	if candidate != nil {
-		return candidate.windowStart.UTC().Truncate(time.Second)
+	start := observation.resetAt.Add(-time.Duration(observation.windowSeconds) * time.Second).UTC().Truncate(time.Second)
+	if start.After(now.Add(5 * time.Minute)) {
+		return time.Time{}, false
 	}
-	return time.Now().UTC().Truncate(time.Second)
+	return start, true
+}
+
+// weeklyQuotaSyncOfficialWindowStartForNewReset only accepts a timestamp that
+// clearly advances the previous upstream boundary. A stale timer must not move
+// a just-reset user's provisional anchor back into the old cycle.
+func weeklyQuotaSyncOfficialWindowStartForNewReset(state *UserWeeklyQuotaSyncState, observation *openAIWeeklyQuotaObservation, now time.Time) (time.Time, bool) {
+	start, ok := weeklyQuotaSyncOfficialWindowStart(observation, now)
+	if !ok {
+		return time.Time{}, false
+	}
+	if state != nil && state.ObservedResetAt != nil && !upstreamWeeklyWindowAdvanced(*state.ObservedResetAt, *observation.resetAt) {
+		return time.Time{}, false
+	}
+	return start, true
+}
+
+// weeklyQuotaSyncOfficialWindowStartForCalibration scopes a delayed timestamp
+// to the provisional reset event. The official start cannot be materially
+// after that observation; otherwise it belongs to a later upstream cycle.
+func weeklyQuotaSyncOfficialWindowStartForCalibration(state *UserWeeklyQuotaSyncState, observation *openAIWeeklyQuotaObservation, now time.Time) (time.Time, bool) {
+	if state == nil || state.PendingWindowStart == nil {
+		return time.Time{}, false
+	}
+	start, ok := weeklyQuotaSyncOfficialWindowStart(observation, now)
+	if !ok || start.After(state.PendingWindowStart.Add(5*time.Minute)) {
+		return time.Time{}, false
+	}
+	if state.ObservedResetAt != nil && !upstreamWeeklyWindowAdvanced(*state.ObservedResetAt, *observation.resetAt) {
+		return time.Time{}, false
+	}
+	return start, true
 }
 
 func setWeeklyQuotaSyncObservationBaseline(state *UserWeeklyQuotaSyncState, observation *openAIWeeklyQuotaObservation) {
@@ -717,24 +860,25 @@ func refreshWeeklyQuotaSyncObservation(state *UserWeeklyQuotaSyncState, observat
 	state.ObservedSource = observation.source
 }
 
-func setWeeklyQuotaSyncConfirmedObservation(state *UserWeeklyQuotaSyncState, observation *openAIWeeklyQuotaObservation, candidate *weeklyQuotaSyncResetCandidate) {
-	if state == nil || observation == nil || candidate == nil {
+func setWeeklyQuotaSyncAfterPercentageReset(state *UserWeeklyQuotaSyncState, observation *openAIWeeklyQuotaObservation, windowStart time.Time, officialAnchor bool) {
+	if state == nil || observation == nil {
 		return
-	}
-	// A percentage-confirmed reset has no trustworthy upstream reset boundary.
-	// Clear the old one so a reset_at that reappears after 1-5% new-cycle usage
-	// is merely established as a new baseline, never interpreted as another
-	// reset of the users' weekly quota.
-	if candidate.signal == userWeeklyQuotaSyncSignalResetTime {
-		state.ObservedResetAt = weeklyQuotaSyncTimePtrFromPtr(candidate.resetAt)
-	} else {
-		state.ObservedResetAt = nil
 	}
 	state.ObservedWindowSeconds = observation.windowSeconds
 	state.ObservedWeeklyUsedPercent = weeklyQuotaSyncFloat64Ptr(observation.usedPercent)
 	state.PeakWeeklyUsedPercent = weeklyQuotaSyncFloat64Ptr(observation.usedPercent)
 	state.ObservedSource = observation.source
-	clearWeeklyQuotaSyncPendingCandidate(state)
+	if officialAnchor {
+		state.ObservedResetAt = weeklyQuotaSyncTimePtrFromPtr(observation.resetAt)
+		clearWeeklyQuotaSyncPendingCandidate(state)
+	} else {
+		// Keep the prior observed reset time so a newly returned timer can prove
+		// that it belongs to this new cycle. Only its start is pending; usage has
+		// already been reset exactly once above.
+		state.PendingSignal = userWeeklyQuotaSyncSignalWindowStartCalibration
+		state.PendingResetAt = nil
+		state.PendingWindowStart = weeklyQuotaSyncTimePtr(windowStart.UTC().Truncate(time.Second))
+	}
 }
 
 func setWeeklyQuotaSyncCheckResultObservation(result *UserWeeklyQuotaSyncCheckResult, observation *openAIWeeklyQuotaObservation) {

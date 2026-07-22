@@ -96,6 +96,13 @@ type UserPlatformQuotaWeeklyCacheResetter interface {
 	ResetUserPlatformQuotaWeeklyCache(ctx context.Context, userIDs []int64, platform string, newStart time.Time) error
 }
 
+// UserPlatformQuotaWeeklyCacheAligner changes only the weekly rolling-window
+// anchor for a known reset event. It preserves weekly usage accumulated in the
+// new cycle while the authoritative upstream reset time becomes available.
+type UserPlatformQuotaWeeklyCacheAligner interface {
+	AlignUserPlatformQuotaWeeklyCache(ctx context.Context, userIDs []int64, platform string, expectedStart, newStart time.Time) error
+}
+
 // ModelPricing 模型价格配置（per-token价格，与LiteLLM格式一致）
 type ModelPricing struct {
 	InputPricePerToken                 float64 // 每token输入价格 (USD)
