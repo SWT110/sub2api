@@ -94,6 +94,31 @@ func (a *userPlatformQuotaServiceAdapter) ResetExpiredWindow(ctx context.Context
 	return err
 }
 
+// SetWeeklyWindowStart adjusts only the rolling weekly anchor and preserves
+// usage. Keep the repository sentinel wrapped consistently with reset calls.
+func (a *userPlatformQuotaServiceAdapter) SetWeeklyWindowStart(ctx context.Context, userID int64, platform string, newStart time.Time) error {
+	err := a.inner.SetWeeklyWindowStart(ctx, userID, platform, newStart)
+	if errors.Is(err, ErrUserPlatformQuotaNotFound) {
+		return fmt.Errorf("%w: %w", service.ErrUserPlatformQuotaNotFound, err)
+	}
+	return err
+}
+
+// ResetWeeklyWindowForPlatform exposes the optional bulk-reset capability used
+// by the Codex weekly quota synchronizer. It intentionally stays outside the
+// base service repository port so existing focused fakes do not need a method
+// they never call.
+func (a *userPlatformQuotaServiceAdapter) ResetWeeklyWindowForPlatform(ctx context.Context, platform string, newStart time.Time) ([]int64, error) {
+	return a.inner.ResetWeeklyWindowForPlatform(ctx, platform, newStart)
+}
+
+// AlignWeeklyWindowStartForPlatform is the companion to the bulk reset above.
+// It is intentionally an optional service capability: only the production
+// adapter exposes it, so narrow request-path fakes remain unchanged.
+func (a *userPlatformQuotaServiceAdapter) AlignWeeklyWindowStartForPlatform(ctx context.Context, platform string, expectedStart, newStart time.Time) ([]int64, error) {
+	return a.inner.AlignWeeklyWindowStartForPlatform(ctx, platform, expectedStart, newStart)
+}
+
 // BatchSnapshotUsage 转换 []service.UserPlatformQuotaSnapshot → []UserPlatformQuotaSnapshot，
 // 调底层 repo，并将 repository FK sentinel 包装为 service sentinel。
 func (a *userPlatformQuotaServiceAdapter) BatchSnapshotUsage(ctx context.Context, snapshots []service.UserPlatformQuotaSnapshot, now time.Time) error {
@@ -184,6 +209,14 @@ func (a *genericUserPlatformQuotaAdapter) UpsertForUser(ctx context.Context, use
 // ResetExpiredWindow 转发至 repository.ResetExpiredWindow（通用 adapter），并包装 sentinel。
 func (a *genericUserPlatformQuotaAdapter) ResetExpiredWindow(ctx context.Context, userID int64, platform string, window string, newStart time.Time) error {
 	err := a.inner.ResetExpiredWindow(ctx, userID, platform, window, newStart)
+	if errors.Is(err, ErrUserPlatformQuotaNotFound) {
+		return fmt.Errorf("%w: %w", service.ErrUserPlatformQuotaNotFound, err)
+	}
+	return err
+}
+
+func (a *genericUserPlatformQuotaAdapter) SetWeeklyWindowStart(ctx context.Context, userID int64, platform string, newStart time.Time) error {
+	err := a.inner.SetWeeklyWindowStart(ctx, userID, platform, newStart)
 	if errors.Is(err, ErrUserPlatformQuotaNotFound) {
 		return fmt.Errorf("%w: %w", service.ErrUserPlatformQuotaNotFound, err)
 	}

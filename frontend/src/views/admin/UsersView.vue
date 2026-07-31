@@ -240,6 +240,14 @@
                 <Icon name="cog" size="sm" class="md:mr-1.5" />
                 <span class="hidden md:inline">{{ t('admin.users.attributes.configButton') }}</span>
               </button>
+              <button
+                @click="showWeeklyQuotaSyncModal = true"
+                class="btn btn-secondary px-2 md:px-3"
+                :title="t('admin.users.weeklyQuotaSync.toolbar')"
+              >
+                <Icon name="sync" size="sm" class="md:mr-1.5" />
+                <span class="hidden md:inline">{{ t('admin.users.weeklyQuotaSync.toolbar') }}</span>
+              </button>
             </div>
 
             <button
@@ -762,6 +770,10 @@
       @close="closePlatformQuotaModal"
       @success="loadUsers"
     />
+    <UserWeeklyQuotaSyncModal
+      :show="showWeeklyQuotaSyncModal"
+      @close="showWeeklyQuotaSyncModal = false"
+    />
     <UserApiKeysModal :show="showApiKeysModal" :user="viewingUser" @close="closeApiKeysModal" />
     <UserAllowedGroupsModal :show="showAllowedGroupsModal" :user="allowedGroupsUser" @close="closeAllowedGroupsModal" @success="loadUsers" />
     <UserBalanceModal :show="showBalanceModal" :user="balanceUser" :operation="balanceOperation" @close="closeBalanceModal" @success="loadUsers" />
@@ -805,6 +817,7 @@ import UserCreateModal from '@/components/admin/user/UserCreateModal.vue'
 import UserEditModal from '@/components/admin/user/UserEditModal.vue'
 import BulkEditUserModal from '@/components/admin/user/BulkEditUserModal.vue'
 import UserPlatformQuotaModal from '@/components/admin/user/UserPlatformQuotaModal.vue'
+import UserWeeklyQuotaSyncModal from '@/components/admin/user/UserWeeklyQuotaSyncModal.vue'
 import UserApiKeysModal from '@/components/admin/user/UserApiKeysModal.vue'
 import UserAllowedGroupsModal from '@/components/admin/user/UserAllowedGroupsModal.vue'
 import UserBalanceModal from '@/components/admin/user/UserBalanceModal.vue'
@@ -1325,6 +1338,7 @@ const showDeleteDialog = ref(false)
 const showApiKeysModal = ref(false)
 const showAttributesModal = ref(false)
 const showPlatformQuotaModal = ref(false)
+const showWeeklyQuotaSyncModal = ref(false)
 const editingUser = ref<AdminUser | null>(null)
 const deletingUser = ref<AdminUser | null>(null)
 const viewingUser = ref<AdminUser | null>(null)

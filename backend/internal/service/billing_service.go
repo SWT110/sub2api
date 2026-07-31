@@ -88,6 +88,21 @@ type BillingCache interface {
 	BatchGetUserPlatformQuotaCache(ctx context.Context, keys []UserPlatformQuotaKey) ([]*UserPlatformQuotaCacheEntry, error)
 }
 
+// UserPlatformQuotaWeeklyCacheResetter is an optional capability implemented
+// by the production Redis cache. Keeping it separate from BillingCache avoids
+// forcing every narrow test double to implement a bulk-only administrative
+// operation.
+type UserPlatformQuotaWeeklyCacheResetter interface {
+	ResetUserPlatformQuotaWeeklyCache(ctx context.Context, userIDs []int64, platform string, newStart time.Time) error
+}
+
+// UserPlatformQuotaWeeklyCacheAligner changes only the weekly rolling-window
+// anchor for a known reset event. It preserves weekly usage accumulated in the
+// new cycle while the authoritative upstream reset time becomes available.
+type UserPlatformQuotaWeeklyCacheAligner interface {
+	AlignUserPlatformQuotaWeeklyCache(ctx context.Context, userIDs []int64, platform string, expectedStart, newStart time.Time) error
+}
+
 // ModelPricing 模型价格配置（per-token价格，与LiteLLM格式一致）
 type ModelPricing struct {
 	InputPricePerToken                 float64 // 每token输入价格 (USD)
@@ -114,10 +129,18 @@ const (
 	openAIGPT54LongContextInputThreshold   = 272000
 	openAIGPT54LongContextInputMultiplier  = 2.0
 	openAIGPT54LongContextOutputMultiplier = 1.5
+	// GPT-5.6 Codex Fast (OpenAI priority tier) is billed at 2.5x of the
+	// corresponding standard token price. Keep this model-specific instead of
+	// changing the generic priority fallback, which remains 2x for other models.
+	openAIGPT56FastTierMultiplier = 2.5
 )
 
 func normalizeBillingServiceTier(serviceTier string) string {
-	return strings.ToLower(strings.TrimSpace(serviceTier))
+	tier := strings.ToLower(strings.TrimSpace(serviceTier))
+	if tier == "fast" {
+		return "priority"
+	}
+	return tier
 }
 
 func usePriorityServiceTierPricing(serviceTier string, pricing *ModelPricing) bool {
@@ -862,7 +885,10 @@ func (s *BillingService) GetModelPricingWithChannel(model string, channelPricing
 	}
 	pricing.ImageOutputPriceExplicit = true
 	applyChannelImageInputPrice(channelPricing, pricing)
-	return pricing, nil
+	// Channel token prices intentionally replace the base catalog prices. Apply
+	// the GPT-5.6 Fast policy once more so a channel override keeps the same
+	// 2.5x Fast-to-standard relationship.
+	return s.applyModelSpecificPricingPolicy(model, pricing), nil
 }
 
 // --- 统一计费入口 ---
@@ -1168,7 +1194,10 @@ func (s *BillingService) applyModelSpecificPricingPolicy(model string, pricing *
 		(pricing.LongContextInputThreshold <= 0 || pricing.LongContextInputMultiplier <= 0 || pricing.LongContextOutputMultiplier <= 0)
 	needsCacheCreationPolicy := isGPT56 && !pricing.CacheCreationPriceExplicit && (pricing.CacheCreationPricePerToken <= 0 ||
 		(pricing.InputPricePerTokenPriority > 0 && pricing.CacheCreationPricePerTokenPriority <= 0))
-	if !needsLongContextPolicy && !needsCacheCreationPolicy {
+	// GPT-5.6 always receives an effective pricing copy because its Fast tier
+	// deliberately overrides any 2x priority prices supplied by the dynamic
+	// catalog. This makes the policy survive catalog refreshes.
+	if !isGPT56 && !needsLongContextPolicy && !needsCacheCreationPolicy {
 		return pricing
 	}
 	cloned := *pricing
@@ -1179,6 +1208,9 @@ func (s *BillingService) applyModelSpecificPricingPolicy(model string, pricing *
 		if cloned.CacheCreationPricePerTokenPriority <= 0 {
 			cloned.CacheCreationPricePerTokenPriority = cloned.InputPricePerTokenPriority * 1.25
 		}
+	}
+	if isGPT56 {
+		applyGPT56FastTierPricing(&cloned)
 	}
 	if isGPT56 || usesLegacyLongContextPricing {
 		if cloned.LongContextInputThreshold <= 0 {
@@ -1192,6 +1224,20 @@ func (s *BillingService) applyModelSpecificPricingPolicy(model string, pricing *
 		}
 	}
 	return &cloned
+}
+
+// applyGPT56FastTierPricing enforces the Codex Fast pricing policy after all
+// catalog and channel prices have been resolved. The dynamic model catalog
+// currently carries 2x priority fields, but GPT-5.6 Fast must consume 2.5x of
+// the standard price for input, output, cache creation, and cache reads.
+func applyGPT56FastTierPricing(pricing *ModelPricing) {
+	if pricing == nil {
+		return
+	}
+	pricing.InputPricePerTokenPriority = pricing.InputPricePerToken * openAIGPT56FastTierMultiplier
+	pricing.OutputPricePerTokenPriority = pricing.OutputPricePerToken * openAIGPT56FastTierMultiplier
+	pricing.CacheCreationPricePerTokenPriority = pricing.CacheCreationPricePerToken * openAIGPT56FastTierMultiplier
+	pricing.CacheReadPricePerTokenPriority = pricing.CacheReadPricePerToken * openAIGPT56FastTierMultiplier
 }
 
 func (s *BillingService) shouldApplySessionLongContextPricing(tokens UsageTokens, pricing *ModelPricing) bool {

@@ -106,6 +106,7 @@ func provideCleanup(
 	paymentOrderExpiry *service.PaymentOrderExpiryService,
 	channelMonitorRunner *service.ChannelMonitorRunner,
 	quotaFlusher *service.UserPlatformQuotaUsageFlusher,
+	weeklyQuotaSync *service.UserWeeklyQuotaSyncService,
 	upstreamBillingProbe *service.UpstreamBillingProbeService,
 	auditLog *service.AuditLogService,
 	promptAudit *securityaudit.PromptService,
@@ -294,6 +295,12 @@ func provideCleanup(
 			{"UserPlatformQuotaUsageFlusher", func() error {
 				if quotaFlusher != nil {
 					quotaFlusher.Stop()
+				}
+				return nil
+			}},
+			{"UserWeeklyQuotaSyncService", func() error {
+				if weeklyQuotaSync != nil {
+					weeklyQuotaSync.Stop()
 				}
 				return nil
 			}},

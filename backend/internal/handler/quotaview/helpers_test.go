@@ -117,17 +117,17 @@ func TestNextDailyResetTime_FollowsServerTimezone(t *testing.T) {
 	}
 }
 
-// TestNextWeeklyResetTime_FollowsServerTimezone 验证下次周重置 = 下周一北京 0 点。
-func TestNextWeeklyResetTime_FollowsServerTimezone(t *testing.T) {
-	if err := timezone.Init("Asia/Shanghai"); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	t.Cleanup(func() { _ = timezone.Init("UTC") })
-
-	// 北京 2026-05-26（周二）→ 下周一是 2026-06-01
-	now := time.Date(2026, 5, 25, 23, 0, 0, 0, time.UTC) // 北京 5/26 07:00 周二
-	want := time.Date(2026, 6, 1, 0, 0, 0, 0, timezone.Location())
-	if got := nextWeeklyResetTime(now); !got.Equal(want) {
+func TestWeeklyResetTimeUsesRollingSevenDayWindow(t *testing.T) {
+	start := time.Date(2026, 5, 25, 23, 0, 0, 0, time.UTC)
+	now := start.Add(48 * time.Hour)
+	want := start.Add(7 * 24 * time.Hour)
+	if got := nextWeeklyResetTime(&start, now); !got.Equal(want) {
 		t.Errorf("nextWeeklyResetTime = %v, want %v", got, want)
+	}
+	if NeedsWeeklyReset(&start, now) {
+		t.Error("weekly window should remain active before seven days have elapsed")
+	}
+	if !NeedsWeeklyReset(&start, start.Add(7*24*time.Hour)) {
+		t.Error("weekly window should expire exactly seven days after its start")
 	}
 }

@@ -1120,10 +1120,10 @@ func (s *BillingCacheService) checkUserPlatformQuotaEligibility(
 			dayStart := timezone.StartOfDay(now)
 			newDailyStart = &dayStart
 		}
-		if quotaWindowExpired(entry.WeeklyWindowStart, timezone.StartOfWeek(now)) {
+		if weeklyQuotaWindowExpired(entry.WeeklyWindowStart, now) {
 			weeklyUsage = 0
 			windowExpired = true
-			weekStart := timezone.StartOfWeek(now)
+			weekStart := now.UTC()
 			newWeeklyStart = &weekStart
 		}
 		if monthlyQuotaWindowExpired(entry.MonthlyWindowStart, now) {
@@ -1170,7 +1170,7 @@ func (s *BillingCacheService) checkUserPlatformQuotaEligibility(
 			return withWindowResetsMetadata(ErrUserPlatformDailyQuotaExhausted, nextDailyReset(now))
 		}
 		if entry.WeeklyLimitUSD != nil && weeklyUsage >= *entry.WeeklyLimitUSD {
-			return withWindowResetsMetadata(ErrUserPlatformWeeklyQuotaExhausted, nextWeeklyReset(now))
+			return withWindowResetsMetadata(ErrUserPlatformWeeklyQuotaExhausted, nextWeeklyResetFrom(newWeeklyStart, now))
 		}
 		if entry.MonthlyLimitUSD != nil && monthlyUsage >= *entry.MonthlyLimitUSD {
 			return withWindowResetsMetadata(ErrUserPlatformMonthlyQuotaExhausted, nextMonthlyResetFrom(entry.MonthlyWindowStart, now))
@@ -1213,7 +1213,7 @@ func (s *BillingCacheService) checkUserPlatformQuotaEligibility(
 		if s.cache != nil && cacheErr == nil {
 			now := time.Now()
 			startOfDay := timezone.StartOfDay(now)
-			startOfWeek := timezone.StartOfWeek(now)
+			startOfWeek := now.UTC()
 			sentinel := &UserPlatformQuotaCacheEntry{
 				SchemaVersion:      UserPlatformQuotaCacheSchemaV1,
 				DailyWindowStart:   &startOfDay,
@@ -1244,8 +1244,11 @@ func (s *BillingCacheService) checkUserPlatformQuotaEligibility(
 	if quotaWindowExpired(rec.DailyWindowStart, timezone.StartOfDay(now)) {
 		dailyUsage = 0
 	}
-	if quotaWindowExpired(rec.WeeklyWindowStart, timezone.StartOfWeek(now)) {
+	weeklyStart := rec.WeeklyWindowStart
+	if weeklyQuotaWindowExpired(rec.WeeklyWindowStart, now) {
 		weeklyUsage = 0
+		start := now.UTC()
+		weeklyStart = &start
 	}
 	if monthlyQuotaWindowExpired(rec.MonthlyWindowStart, now) {
 		monthlyUsage = 0
@@ -1257,7 +1260,7 @@ func (s *BillingCacheService) checkUserPlatformQuotaEligibility(
 			return withWindowResetsMetadata(ErrUserPlatformDailyQuotaExhausted, nextDailyReset(now))
 		}
 		if rec.WeeklyLimitUSD != nil && weeklyUsage >= *rec.WeeklyLimitUSD {
-			return withWindowResetsMetadata(ErrUserPlatformWeeklyQuotaExhausted, nextWeeklyReset(now))
+			return withWindowResetsMetadata(ErrUserPlatformWeeklyQuotaExhausted, nextWeeklyResetFrom(weeklyStart, now))
 		}
 		if rec.MonthlyLimitUSD != nil && monthlyUsage >= *rec.MonthlyLimitUSD {
 			return withWindowResetsMetadata(ErrUserPlatformMonthlyQuotaExhausted, nextMonthlyResetFrom(rec.MonthlyWindowStart, now))
@@ -1275,7 +1278,7 @@ func (s *BillingCacheService) checkUserPlatformQuotaEligibility(
 		WeeklyLimitUSD:     rec.WeeklyLimitUSD,
 		MonthlyLimitUSD:    rec.MonthlyLimitUSD,
 		DailyWindowStart:   rec.DailyWindowStart,
-		WeeklyWindowStart:  rec.WeeklyWindowStart,
+		WeeklyWindowStart:  weeklyStart,
 		MonthlyWindowStart: rec.MonthlyWindowStart,
 	}
 	if s.cache != nil {
@@ -1294,7 +1297,7 @@ func (s *BillingCacheService) checkUserPlatformQuotaEligibility(
 		return withWindowResetsMetadata(ErrUserPlatformDailyQuotaExhausted, nextDailyReset(now))
 	}
 	if rec.WeeklyLimitUSD != nil && weeklyUsage >= *rec.WeeklyLimitUSD {
-		return withWindowResetsMetadata(ErrUserPlatformWeeklyQuotaExhausted, nextWeeklyReset(now))
+		return withWindowResetsMetadata(ErrUserPlatformWeeklyQuotaExhausted, nextWeeklyResetFrom(weeklyStart, now))
 	}
 	if rec.MonthlyLimitUSD != nil && monthlyUsage >= *rec.MonthlyLimitUSD {
 		return withWindowResetsMetadata(ErrUserPlatformMonthlyQuotaExhausted, nextMonthlyResetFrom(rec.MonthlyWindowStart, now))
@@ -1319,10 +1322,14 @@ func nextDailyReset(now time.Time) time.Time {
 	return timezone.StartOfDay(now).AddDate(0, 0, 1)
 }
 
-// nextWeeklyReset 计算下一个周窗口起点（下周一全局时区 0 点）。
-// 必须与 timezone.StartOfWeek 同口径，否则 Retry-After 会偏差。
-func nextWeeklyReset(now time.Time) time.Time {
-	return timezone.StartOfWeek(now).AddDate(0, 0, 7)
+// nextWeeklyResetFrom returns the end of a rolling 7-day weekly window.
+// A nil or expired start is treated as a window beginning now, matching the
+// reset performed by the next usage write.
+func nextWeeklyResetFrom(start *time.Time, now time.Time) time.Time {
+	if start == nil || weeklyQuotaWindowExpired(start, now) {
+		return now.UTC().Add(7 * 24 * time.Hour)
+	}
+	return start.Add(7 * 24 * time.Hour)
 }
 
 // nextMonthlyResetFrom 返回 30 天滚动窗口的下次重置时间（start + 30d）。
@@ -1352,6 +1359,15 @@ func monthlyQuotaWindowExpired(start *time.Time, now time.Time) bool {
 		return true
 	}
 	return now.Sub(*start) >= 30*24*time.Hour
+}
+
+// weeklyQuotaWindowExpired implements the same rolling-window semantics as
+// the repository write path. It intentionally does not use StartOfWeek.
+func weeklyQuotaWindowExpired(start *time.Time, now time.Time) bool {
+	if start == nil {
+		return true
+	}
+	return !now.Before(start.Add(7 * 24 * time.Hour))
 }
 
 // HasUserPlatformQuotaLimit 判断该 user×platform 是否设了任一非 nil limit。

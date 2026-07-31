@@ -132,3 +132,61 @@ func TestUserPlatformQuotaCache_Delete(t *testing.T) {
 		t.Error("expected miss after delete")
 	}
 }
+
+func TestUserPlatformQuotaCache_AlignWeeklyWindowStartPreservesUsage(t *testing.T) {
+	c, _ := newMiniRedisCache(t)
+	ctx := context.Background()
+	expectedStart := time.Date(2026, 7, 20, 10, 5, 0, 0, time.UTC)
+	authoritativeStart := expectedStart.Add(-2 * time.Minute)
+	weeklyLimit := 20.0
+	if err := c.SetUserPlatformQuotaCache(ctx, 1, "openai", &service.UserPlatformQuotaCacheEntry{
+		WeeklyUsageUSD:    4.25,
+		WeeklyLimitUSD:    &weeklyLimit,
+		WeeklyWindowStart: &expectedStart,
+		Version:           7,
+		SchemaVersion:     service.UserPlatformQuotaCacheSchemaV1,
+	}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	dirtyMember := userPlatformQuotaDirtyMember(1, "openai")
+	if err := c.rdb.SAdd(ctx, userPlatformQuotaDirtySetKey(), dirtyMember).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.AlignUserPlatformQuotaWeeklyCache(ctx, []int64{1}, "openai", expectedStart, authoritativeStart); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := c.GetUserPlatformQuotaCache(ctx, 1, "openai")
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if got.WeeklyUsageUSD != 4.25 {
+		t.Errorf("WeeklyUsageUSD = %v, want 4.25", got.WeeklyUsageUSD)
+	}
+	if got.WeeklyWindowStart == nil || !got.WeeklyWindowStart.Equal(authoritativeStart) {
+		t.Errorf("WeeklyWindowStart = %v, want %v", got.WeeklyWindowStart, authoritativeStart)
+	}
+	if got.Version != 8 {
+		t.Errorf("Version = %d, want 8", got.Version)
+	}
+	stillDirty, err := c.rdb.SIsMember(ctx, userPlatformQuotaDirtySetKey(), dirtyMember).Result()
+	if err != nil || !stillDirty {
+		t.Errorf("dirty member should be preserved: present=%v err=%v", stillDirty, err)
+	}
+
+	// A later administrator change has a different anchor and must not be
+	// overwritten by a delayed calibration for the prior provisional start.
+	if err := c.AlignUserPlatformQuotaWeeklyCache(ctx, []int64{1}, "openai", expectedStart, expectedStart.Add(-3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err = c.GetUserPlatformQuotaCache(ctx, 1, "openai")
+	if err != nil || !ok {
+		t.Fatalf("get after skipped alignment: ok=%v err=%v", ok, err)
+	}
+	if got.WeeklyWindowStart == nil || !got.WeeklyWindowStart.Equal(authoritativeStart) {
+		t.Errorf("WeeklyWindowStart changed after stale alignment: %v", got.WeeklyWindowStart)
+	}
+	if got.Version != 8 {
+		t.Errorf("Version changed after stale alignment: %d", got.Version)
+	}
+}

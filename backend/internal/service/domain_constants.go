@@ -361,6 +361,14 @@ const (
 	// SettingKeyOpsRuntimeLogConfig stores JSON config for runtime log settings.
 	SettingKeyOpsRuntimeLogConfig = "ops_runtime_log_config"
 
+	// SettingKeyUserWeeklyQuotaSyncConfig stores the source Codex account and
+	// polling settings for synchronizing user OpenAI weekly quota windows.
+	SettingKeyUserWeeklyQuotaSyncConfig = "user_weekly_quota_sync_config"
+
+	// SettingKeyUserWeeklyQuotaSyncState stores the last observed upstream
+	// reset boundary and operational status separately from editable config.
+	SettingKeyUserWeeklyQuotaSyncState = "user_weekly_quota_sync_state"
+
 	// =========================
 	// Channel Monitor (渠道监控)
 	// =========================
